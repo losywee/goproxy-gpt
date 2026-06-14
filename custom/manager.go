@@ -1,7 +1,7 @@
 package custom
 
 import (
-	"crypto/tls"
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -21,11 +22,11 @@ import (
 
 // Manager 订阅管理器
 type Manager struct {
-	storage    *storage.Storage
-	validator  *validator.Validator
-	singbox    *SingBoxProcess
-	stopCh     chan struct{}
-	refreshMu  sync.Mutex // 防止并发刷新
+	storage   *storage.Storage
+	validator *validator.Validator
+	singbox   *SingBoxProcess
+	stopCh    chan struct{}
+	refreshMu sync.Mutex // 防止并发刷新
 }
 
 // NewManager 创建订阅管理器
@@ -386,6 +387,10 @@ func (m *Manager) fetchSubscriptionData(sub *storage.Subscription) ([]byte, erro
 
 // fetchWithRetry 尝试拉取 URL（直连 → 代理，多种方式）
 func (m *Manager) fetchWithRetry(urlStr string) ([]byte, error) {
+	if err := validateSubscriptionURL(urlStr); err != nil {
+		return nil, err
+	}
+
 	// 先尝试直连
 	data, err := m.fetchURL(urlStr, nil)
 	if err == nil {
@@ -410,14 +415,58 @@ func (m *Manager) fetchWithRetry(urlStr string) ([]byte, error) {
 	return nil, fmt.Errorf("直连和代理均无法访问订阅 URL: %w", err)
 }
 
+func validateSubscriptionURL(rawURL string) error {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("订阅 URL 无效: %w", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("订阅 URL 仅支持 http/https")
+	}
+	host := u.Hostname()
+	if host == "" {
+		return fmt.Errorf("订阅 URL 缺少主机名")
+	}
+	lowerHost := strings.ToLower(host)
+	if lowerHost == "localhost" || strings.HasSuffix(lowerHost, ".localhost") {
+		return fmt.Errorf("订阅 URL 不允许访问本机地址")
+	}
+
+	if ip := net.ParseIP(host); ip != nil {
+		if isBlockedSubscriptionIP(ip) {
+			return fmt.Errorf("订阅 URL 不允许访问内网地址")
+		}
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return fmt.Errorf("解析订阅域名失败: %w", err)
+	}
+	for _, addr := range addrs {
+		if isBlockedSubscriptionIP(addr.IP) {
+			return fmt.Errorf("订阅 URL 不允许解析到内网地址")
+		}
+	}
+	return nil
+}
+
+func isBlockedSubscriptionIP(ip net.IP) bool {
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast()
+}
+
 // fetchURL 通过指定代理（或直连）拉取 URL 内容
 func (m *Manager) fetchURL(urlStr string, p *storage.Proxy) ([]byte, error) {
+	if err := validateSubscriptionURL(urlStr); err != nil {
+		return nil, err
+	}
+
 	transport := &http.Transport{}
 
 	if p != nil {
-		// 通过代理访问时跳过 TLS 验证（免费代理可能 MITM）
-		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
-
 		switch p.Protocol {
 		case "socks5":
 			dialer, err := proxy.SOCKS5("tcp", p.Address, nil, proxy.Direct)
@@ -434,7 +483,16 @@ func (m *Manager) fetchURL(urlStr string, p *storage.Proxy) ([]byte, error) {
 		}
 	}
 
-	client := &http.Client{Timeout: 30 * time.Second, Transport: transport}
+	client := &http.Client{
+		Timeout:   30 * time.Second,
+		Transport: transport,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return http.ErrUseLastResponse
+			}
+			return validateSubscriptionURL(req.URL.String())
+		},
+	}
 	req, err := http.NewRequest("GET", urlStr, nil)
 	if err != nil {
 		return nil, err
@@ -500,10 +558,10 @@ func (m *Manager) GetStatus() map[string]interface{} {
 	subs, _ := m.storage.GetSubscriptions()
 
 	return map[string]interface{}{
-		"singbox_running":   m.singbox.IsRunning(),
-		"singbox_nodes":     m.singbox.GetNodeCount(),
-		"custom_count":      customCount,
-		"disabled_count":    len(disabled),
+		"singbox_running":    m.singbox.IsRunning(),
+		"singbox_nodes":      m.singbox.GetNodeCount(),
+		"custom_count":       customCount,
+		"disabled_count":     len(disabled),
 		"subscription_count": len(subs),
 	}
 }

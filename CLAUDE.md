@@ -97,10 +97,12 @@ main.go (orchestrator)
 | 7778 | WebUI dashboard |
 | 7779 | SOCKS5 proxy (random rotation mode) |
 | 7780 | SOCKS5 proxy (lowest-latency mode) |
+| 7781 | HTTP proxy (country-filtered random rotation mode) |
+| 7782 | SOCKS5 proxy (country-filtered random rotation mode) |
 
 ### Configuration
 
-- Environment variables: `WEBUI_PASSWORD`, `PROXY_AUTH_ENABLED`, `PROXY_AUTH_USERNAME`, `PROXY_AUTH_PASSWORD`, `BLOCKED_COUNTRIES`, `ALLOWED_COUNTRIES`, `DATA_DIR`
+- Environment variables: `WEBUI_PASSWORD`, `PROXY_AUTH_ENABLED`, `PROXY_AUTH_USERNAME`, `PROXY_AUTH_PASSWORD`, `BLOCKED_COUNTRIES`, `ALLOWED_COUNTRIES`, `COUNTRY_PROXY_COUNTRIES`, `COUNTRY_SOCKS5_PORT`, `DATA_DIR`
 - Persistent config: `config.json` (or `$DATA_DIR/config.json`) — pool capacity, latency thresholds, intervals, geo-filter (blocked/allowed countries). Editable via WebUI.
 - Config is loaded once at startup via `config.Load()`, updated in-memory via `config.Save()`. Thread-safe via `sync.RWMutex`.
 - Geo-filter: `ALLOWED_COUNTRIES` (whitelist) takes priority over `BLOCKED_COUNTRIES` (blacklist). When whitelist is non-empty, only listed countries are admitted; blacklist is ignored. Both are comma-separated country codes (e.g. `US,JP,KR`). Configurable at runtime via WebUI; `config.json` values override env vars after first save.

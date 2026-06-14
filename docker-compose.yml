@@ -15,6 +15,8 @@ services:
       - "${WEBUI_PORT:-7778}:7778"           # WebUI（有登录认证）
       - "${SOCKS5_RANDOM_PORT:-7779}:7779"   # SOCKS5 随机轮换
       - "${SOCKS5_STABLE_PORT:-7780}:7780"   # SOCKS5 最低延迟
+      - "${COUNTRY_PROXY_PORT:-7781}:7781"   # HTTP 国家过滤
+      - "${COUNTRY_SOCKS5_PORT:-7782}:7782"  # SOCKS5 国家过滤
     volumes:
       - goproxy-data:/app/data
     environment:
@@ -26,6 +28,8 @@ services:
       - PROXY_AUTH_PASSWORD=${PROXY_AUTH_PASSWORD}
       - BLOCKED_COUNTRIES=${BLOCKED_COUNTRIES:-CN}
       - ALLOWED_COUNTRIES=${ALLOWED_COUNTRIES}
+      - COUNTRY_PROXY_COUNTRIES=${COUNTRY_PROXY_COUNTRIES}
+      - COUNTRY_SOCKS5_PORT=${COUNTRY_SOCKS5_PORT:-7782}
       - CUSTOM_PROXY_MODE=${CUSTOM_PROXY_MODE:-mixed}
       - SINGBOX_PATH=sing-box
     healthcheck:

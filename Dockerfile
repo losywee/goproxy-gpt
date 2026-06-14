@@ -31,6 +31,6 @@ WORKDIR /app
 COPY --from=builder /app/proxy-pool .
 COPY --from=builder /app/sing-box /usr/local/bin/sing-box
 
-EXPOSE 7776 7777 7778 7779 7780
+EXPOSE 7776 7777 7778 7779 7780 7781 7782
 
 CMD ["./proxy-pool"]

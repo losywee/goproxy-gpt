@@ -40,6 +40,12 @@ type Config struct {
 	// 稳定 SOCKS5 端口（最低延迟模式）
 	StableSOCKS5Port string
 
+	// 国家过滤 HTTP 代理端口（随机轮换模式）
+	CountryProxyPort string
+
+	// 国家过滤 SOCKS5 代理端口（随机轮换模式）
+	CountrySOCKS5Port string
+
 	// 代理服务认证配置
 	ProxyAuthEnabled      bool   // 是否启用代理认证（默认 false）
 	ProxyAuthUsername     string // 代理认证用户名（默认 "proxy"）
@@ -47,8 +53,9 @@ type Config struct {
 	ProxyAuthPasswordHash string // 代理认证密码 SHA256 哈希（用于 HTTP）
 
 	// 地理过滤配置
-	BlockedCountries []string // 屏蔽的国家代码列表（如 ["CN", "RU"]，默认 ["CN"]）
-	AllowedCountries []string // 允许的国家代码列表（白名单，非空时优先于黑名单）
+	BlockedCountries      []string // 屏蔽的国家代码列表（如 ["CN", "RU"]，默认 ["CN"]）
+	AllowedCountries      []string // 允许的国家代码列表（白名单，非空时优先于黑名单）
+	CountryProxyCountries []string // 国家过滤代理端口使用的国家代码列表（为空时不提供代理）
 
 	// SQLite 数据库路径
 	DBPath string
@@ -70,8 +77,8 @@ type Config struct {
 	ValidateURL         string // 验证目标 URL
 
 	// ========== 健康检查配置 ==========
-	HealthCheckInterval   int // 状态监控间隔（分钟）（默认5）
-	HealthCheckBatchSize  int // 每批验证数量（默认20）
+	HealthCheckInterval    int // 状态监控间隔（分钟）（默认5）
+	HealthCheckBatchSize   int // 每批验证数量（默认20）
 	HealthCheckConcurrency int // 批次内并发数（默认50）
 
 	// ========== 优化配置 ==========
@@ -86,6 +93,7 @@ type Config struct {
 	SourceFailThreshold    int // 源降级阈值（默认3）
 	SourceDisableThreshold int // 源禁用阈值（默认5）
 	SourceCooldownMinutes  int // 源禁用冷却时间（默认30）
+	CustomSources          []SourceConfig
 
 	// ========== 自定义订阅代理配置 ==========
 	CustomProxyMode       string // 代理使用模式：mixed / custom_only / free_only（默认 mixed）
@@ -108,10 +116,91 @@ type Config struct {
 	SOCKS5SourceURL string
 }
 
+// SourceConfig 可编辑代理来源配置
+type SourceConfig struct {
+	URL      string `json:"url"`
+	Protocol string `json:"protocol"`
+}
+
 var (
 	globalCfg *Config
 	cfgMu     sync.RWMutex
 )
+
+func cloneConfig(cfg *Config) *Config {
+	if cfg == nil {
+		return nil
+	}
+	cloned := *cfg
+	if cfg.BlockedCountries != nil {
+		cloned.BlockedCountries = append([]string(nil), cfg.BlockedCountries...)
+	}
+	if cfg.AllowedCountries != nil {
+		cloned.AllowedCountries = append([]string(nil), cfg.AllowedCountries...)
+	}
+	if cfg.CountryProxyCountries != nil {
+		cloned.CountryProxyCountries = append([]string(nil), cfg.CountryProxyCountries...)
+	}
+	if cfg.CustomSources != nil {
+		cloned.CustomSources = append([]SourceConfig(nil), cfg.CustomSources...)
+	}
+	return &cloned
+}
+
+// NormalizeCustomSources 规范化用户自定义来源，去重并只保留 http/socks5 协议。
+func NormalizeCustomSources(sources []SourceConfig) []SourceConfig {
+	seen := make(map[string]bool, len(sources))
+	normalized := make([]SourceConfig, 0, len(sources))
+	for _, source := range sources {
+		url := strings.TrimSpace(source.URL)
+		protocol := strings.TrimSpace(strings.ToLower(source.Protocol))
+		if protocol == "socks4" {
+			protocol = "socks5"
+		}
+		if url == "" || (protocol != "http" && protocol != "socks5") {
+			continue
+		}
+		key := protocol + "\n" + url
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		normalized = append(normalized, SourceConfig{URL: url, Protocol: protocol})
+	}
+	return normalized
+}
+
+func normalizeCountryCodes(countries []string) []string {
+	seen := make(map[string]bool, len(countries))
+	normalized := make([]string, 0, len(countries))
+	for _, country := range countries {
+		country = strings.TrimSpace(strings.ToUpper(country))
+		if country == "" || seen[country] {
+			continue
+		}
+		seen[country] = true
+		normalized = append(normalized, country)
+	}
+	return normalized
+}
+
+func parseCountryCodes(value string) []string {
+	if value == "" {
+		return nil
+	}
+	return normalizeCountryCodes(strings.Split(value, ","))
+}
+
+func listenAddress(value, fallback string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return fallback
+	}
+	if strings.HasPrefix(value, ":") {
+		return value
+	}
+	return ":" + value
+}
 
 func passwordHash(plain string) string {
 	return fmt.Sprintf("%x", sha256.Sum256([]byte(plain)))
@@ -123,7 +212,7 @@ func DefaultConfig() *Config {
 	if password == "" {
 		password = DefaultPassword
 	}
-	
+
 	// 读取代理认证配置
 	proxyAuthEnabled := os.Getenv("PROXY_AUTH_ENABLED") == "true"
 	proxyAuthUsername := os.Getenv("PROXY_AUTH_USERNAME")
@@ -135,34 +224,25 @@ func DefaultConfig() *Config {
 	if proxyAuthPassword != "" {
 		proxyAuthHash = passwordHash(proxyAuthPassword)
 	}
-	
+
 	// 读取地理过滤配置
 	blockedCountries := []string{"CN"} // 默认屏蔽中国大陆
 	if blockedEnv := os.Getenv("BLOCKED_COUNTRIES"); blockedEnv != "" {
 		// 支持逗号分隔的国家代码，如 "CN,RU,KP"
-		countries := strings.Split(blockedEnv, ",")
-		blockedCountries = make([]string, 0, len(countries))
-		for _, c := range countries {
-			c = strings.TrimSpace(strings.ToUpper(c))
-			if c != "" {
-				blockedCountries = append(blockedCountries, c)
-			}
-		}
+		blockedCountries = parseCountryCodes(blockedEnv)
 	}
 
 	// 读取白名单配置（白名单非空时优先于黑名单）
-	var allowedCountries []string
-	if allowedEnv := os.Getenv("ALLOWED_COUNTRIES"); allowedEnv != "" {
-		countries := strings.Split(allowedEnv, ",")
-		allowedCountries = make([]string, 0, len(countries))
-		for _, c := range countries {
-			c = strings.TrimSpace(strings.ToUpper(c))
-			if c != "" {
-				allowedCountries = append(allowedCountries, c)
-			}
-		}
+	allowedCountries := parseCountryCodes(os.Getenv("ALLOWED_COUNTRIES"))
+
+	// 读取国家过滤代理配置
+	countryProxyPort := listenAddress(os.Getenv("COUNTRY_PROXY_PORT"), ":7781")
+	countrySOCKS5Port := listenAddress(os.Getenv("COUNTRY_SOCKS5_PORT"), ":7782")
+	countryProxyCountries := parseCountryCodes(os.Getenv("COUNTRY_PROXY_COUNTRIES"))
+	if len(countryProxyCountries) == 0 {
+		countryProxyCountries = parseCountryCodes(os.Getenv("COUNTRY_FILTER_COUNTRIES"))
 	}
-	
+
 	// 读取订阅代理配置
 	customProxyMode := os.Getenv("CUSTOM_PROXY_MODE")
 	if customProxyMode == "" {
@@ -181,22 +261,25 @@ func DefaultConfig() *Config {
 		StableProxyPort:   ":7776",
 		SOCKS5Port:        ":7779",
 		StableSOCKS5Port:  ":7780",
+		CountryProxyPort:  countryProxyPort,
+		CountrySOCKS5Port: countrySOCKS5Port,
 		DBPath:            dataDir() + "proxy.db",
-		
+
 		// 代理认证配置
 		ProxyAuthEnabled:      proxyAuthEnabled,
 		ProxyAuthUsername:     proxyAuthUsername,
 		ProxyAuthPassword:     proxyAuthPassword,
 		ProxyAuthPasswordHash: proxyAuthHash,
-		
+
 		// 地理过滤配置
-		BlockedCountries: blockedCountries,
-		AllowedCountries: allowedCountries,
+		BlockedCountries:      blockedCountries,
+		AllowedCountries:      allowedCountries,
+		CountryProxyCountries: countryProxyCountries,
 
 		// 池子容量配置
-		PoolMaxSize:        100,  // 总容量
-		PoolHTTPRatio:      0.3,  // HTTP占30%
-		PoolMinPerProtocol: 10,   // 每协议最少10个
+		PoolMaxSize:        100, // 总容量
+		PoolHTTPRatio:      0.3, // HTTP占30%
+		PoolMinPerProtocol: 10,  // 每协议最少10个
 
 		// 延迟标准配置
 		MaxLatencyMs:          2500, // 标准2.5秒
@@ -236,12 +319,12 @@ func DefaultConfig() *Config {
 		SingBoxBasePort:       20000,
 
 		// 兼容旧配置
-		MaxResponseMs: 5000,
-		MaxFailCount:  3,
-		MaxRetry:      3,
-		FetchInterval: 30,
-		CheckInterval: 10,
-		HTTPSourceURL: "https://cdn.jsdelivr.net/gh/databay-labs/free-proxy-list/http.txt",
+		MaxResponseMs:   5000,
+		MaxFailCount:    3,
+		MaxRetry:        3,
+		FetchInterval:   30,
+		CheckInterval:   10,
+		HTTPSourceURL:   "https://cdn.jsdelivr.net/gh/databay-labs/free-proxy-list/http.txt",
 		SOCKS5SourceURL: "https://cdn.jsdelivr.net/gh/databay-labs/free-proxy-list/socks5.txt",
 	}
 }
@@ -290,13 +373,38 @@ func Load() *Config {
 			if saved.HealthCheckBatchSize > 0 {
 				cfg.HealthCheckBatchSize = saved.HealthCheckBatchSize
 			}
+			if saved.HealthCheckConcurrency > 0 {
+				cfg.HealthCheckConcurrency = saved.HealthCheckConcurrency
+			}
 
 			// 优化配置
 			if saved.OptimizeInterval > 0 {
 				cfg.OptimizeInterval = saved.OptimizeInterval
 			}
+			if saved.OptimizeConcurrency > 0 {
+				cfg.OptimizeConcurrency = saved.OptimizeConcurrency
+			}
 			if saved.ReplaceThreshold > 0 && saved.ReplaceThreshold <= 1 {
 				cfg.ReplaceThreshold = saved.ReplaceThreshold
+			}
+
+			// IP 查询配置
+			if saved.IPQueryRateLimit > 0 {
+				cfg.IPQueryRateLimit = saved.IPQueryRateLimit
+			}
+
+			// 源管理配置
+			if saved.SourceFailThreshold > 0 {
+				cfg.SourceFailThreshold = saved.SourceFailThreshold
+			}
+			if saved.SourceDisableThreshold > 0 {
+				cfg.SourceDisableThreshold = saved.SourceDisableThreshold
+			}
+			if saved.SourceCooldownMinutes > 0 {
+				cfg.SourceCooldownMinutes = saved.SourceCooldownMinutes
+			}
+			if saved.CustomSources != nil {
+				cfg.CustomSources = NormalizeCustomSources(saved.CustomSources)
 			}
 
 			// 兼容旧配置
@@ -309,10 +417,13 @@ func Load() *Config {
 
 			// 地理过滤配置（config.json 优先于环境变量）
 			if saved.BlockedCountries != nil {
-				cfg.BlockedCountries = saved.BlockedCountries
+				cfg.BlockedCountries = normalizeCountryCodes(saved.BlockedCountries)
 			}
 			if saved.AllowedCountries != nil {
-				cfg.AllowedCountries = saved.AllowedCountries
+				cfg.AllowedCountries = normalizeCountryCodes(saved.AllowedCountries)
+			}
+			if saved.CountryProxyCountries != nil {
+				cfg.CountryProxyCountries = normalizeCountryCodes(saved.CountryProxyCountries)
 			}
 
 			// 自定义订阅代理配置
@@ -340,16 +451,16 @@ func Load() *Config {
 		}
 	}
 	cfgMu.Lock()
-	globalCfg = cfg
+	globalCfg = cloneConfig(cfg)
 	cfgMu.Unlock()
-	return cfg
+	return cloneConfig(cfg)
 }
 
-// Get 获取当前配置
+// Get 获取当前配置快照。调用方可以安全读取或修改返回值，不会和 Save 并发写入冲突。
 func Get() *Config {
 	cfgMu.RLock()
 	defer cfgMu.RUnlock()
-	return globalCfg
+	return cloneConfig(globalCfg)
 }
 
 // savedConfig 持久化可调整的字段
@@ -369,16 +480,28 @@ type savedConfig struct {
 	ValidateTimeout     int `json:"validate_timeout"`
 
 	// 健康检查配置
-	HealthCheckInterval  int `json:"health_check_interval"`
-	HealthCheckBatchSize int `json:"health_check_batch_size"`
+	HealthCheckInterval    int `json:"health_check_interval"`
+	HealthCheckBatchSize   int `json:"health_check_batch_size"`
+	HealthCheckConcurrency int `json:"health_check_concurrency,omitempty"`
 
 	// 优化配置
-	OptimizeInterval int     `json:"optimize_interval"`
-	ReplaceThreshold float64 `json:"replace_threshold"`
+	OptimizeInterval    int     `json:"optimize_interval"`
+	OptimizeConcurrency int     `json:"optimize_concurrency,omitempty"`
+	ReplaceThreshold    float64 `json:"replace_threshold"`
+
+	// IP查询配置
+	IPQueryRateLimit int `json:"ip_query_rate_limit,omitempty"`
+
+	// 源管理配置
+	SourceFailThreshold    int            `json:"source_fail_threshold,omitempty"`
+	SourceDisableThreshold int            `json:"source_disable_threshold,omitempty"`
+	SourceCooldownMinutes  int            `json:"source_cooldown_minutes,omitempty"`
+	CustomSources          []SourceConfig `json:"custom_sources,omitempty"`
 
 	// 地理过滤配置
-	BlockedCountries []string `json:"blocked_countries,omitempty"`
-	AllowedCountries []string `json:"allowed_countries,omitempty"`
+	BlockedCountries      []string `json:"blocked_countries,omitempty"`
+	AllowedCountries      []string `json:"allowed_countries,omitempty"`
+	CountryProxyCountries []string `json:"country_proxy_countries,omitempty"`
 
 	// 自定义订阅代理配置
 	CustomProxyMode       string `json:"custom_proxy_mode,omitempty"`
@@ -396,36 +519,49 @@ type savedConfig struct {
 
 // Save 保存配置到文件，并更新内存配置
 func Save(cfg *Config) error {
+	cfgCopy := cloneConfig(cfg)
+	if cfgCopy == nil {
+		return fmt.Errorf("config is nil")
+	}
+
 	cfgMu.Lock()
-	*globalCfg = *cfg
+	globalCfg = cfgCopy
 	cfgMu.Unlock()
 
-	customPriority := cfg.CustomPriority
-	customFreePriority := cfg.CustomFreePriority
+	customPriority := cfgCopy.CustomPriority
+	customFreePriority := cfgCopy.CustomFreePriority
 	data, err := json.MarshalIndent(savedConfig{
-		PoolMaxSize:           cfg.PoolMaxSize,
-		PoolHTTPRatio:         cfg.PoolHTTPRatio,
-		PoolMinPerProtocol:    cfg.PoolMinPerProtocol,
-		MaxLatencyMs:          cfg.MaxLatencyMs,
-		MaxLatencyEmergency:   cfg.MaxLatencyEmergency,
-		MaxLatencyHealthy:     cfg.MaxLatencyHealthy,
-		ValidateConcurrency:   cfg.ValidateConcurrency,
-		ValidateTimeout:       cfg.ValidateTimeout,
-		HealthCheckInterval:   cfg.HealthCheckInterval,
-		HealthCheckBatchSize:  cfg.HealthCheckBatchSize,
-		OptimizeInterval:      cfg.OptimizeInterval,
-		ReplaceThreshold:      cfg.ReplaceThreshold,
-		BlockedCountries:      cfg.BlockedCountries,
-		AllowedCountries:      cfg.AllowedCountries,
-		CustomProxyMode:       cfg.CustomProxyMode,
-		CustomPriority:        &customPriority,
-		CustomFreePriority:    &customFreePriority,
-		CustomProbeInterval:   cfg.CustomProbeInterval,
-		CustomRefreshInterval: cfg.CustomRefreshInterval,
-		SingBoxPath:           cfg.SingBoxPath,
-		SingBoxBasePort:       cfg.SingBoxBasePort,
-		FetchInterval:         cfg.FetchInterval,
-		CheckInterval:         cfg.CheckInterval,
+		PoolMaxSize:            cfgCopy.PoolMaxSize,
+		PoolHTTPRatio:          cfgCopy.PoolHTTPRatio,
+		PoolMinPerProtocol:     cfgCopy.PoolMinPerProtocol,
+		MaxLatencyMs:           cfgCopy.MaxLatencyMs,
+		MaxLatencyEmergency:    cfgCopy.MaxLatencyEmergency,
+		MaxLatencyHealthy:      cfgCopy.MaxLatencyHealthy,
+		ValidateConcurrency:    cfgCopy.ValidateConcurrency,
+		ValidateTimeout:        cfgCopy.ValidateTimeout,
+		HealthCheckInterval:    cfgCopy.HealthCheckInterval,
+		HealthCheckBatchSize:   cfgCopy.HealthCheckBatchSize,
+		HealthCheckConcurrency: cfgCopy.HealthCheckConcurrency,
+		OptimizeInterval:       cfgCopy.OptimizeInterval,
+		OptimizeConcurrency:    cfgCopy.OptimizeConcurrency,
+		ReplaceThreshold:       cfgCopy.ReplaceThreshold,
+		IPQueryRateLimit:       cfgCopy.IPQueryRateLimit,
+		SourceFailThreshold:    cfgCopy.SourceFailThreshold,
+		SourceDisableThreshold: cfgCopy.SourceDisableThreshold,
+		SourceCooldownMinutes:  cfgCopy.SourceCooldownMinutes,
+		CustomSources:          NormalizeCustomSources(cfgCopy.CustomSources),
+		BlockedCountries:       normalizeCountryCodes(cfgCopy.BlockedCountries),
+		AllowedCountries:       normalizeCountryCodes(cfgCopy.AllowedCountries),
+		CountryProxyCountries:  normalizeCountryCodes(cfgCopy.CountryProxyCountries),
+		CustomProxyMode:        cfgCopy.CustomProxyMode,
+		CustomPriority:         &customPriority,
+		CustomFreePriority:     &customFreePriority,
+		CustomProbeInterval:    cfgCopy.CustomProbeInterval,
+		CustomRefreshInterval:  cfgCopy.CustomRefreshInterval,
+		SingBoxPath:            cfgCopy.SingBoxPath,
+		SingBoxBasePort:        cfgCopy.SingBoxBasePort,
+		FetchInterval:          cfgCopy.FetchInterval,
+		CheckInterval:          cfgCopy.CheckInterval,
 	}, "", "  ")
 	if err != nil {
 		return err

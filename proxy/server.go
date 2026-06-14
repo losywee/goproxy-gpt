@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bufio"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
@@ -19,10 +20,11 @@ import (
 )
 
 type Server struct {
-	storage *storage.Storage
-	cfg     *config.Config
-	mode    string // "random" 或 "lowest-latency"
-	port    string
+	storage     *storage.Storage
+	cfg         *config.Config
+	mode        string // "random" 或 "lowest-latency"
+	port        string
+	countryMode bool
 }
 
 func New(s *storage.Storage, cfg *config.Config, mode string, port string) *Server {
@@ -34,29 +36,73 @@ func New(s *storage.Storage, cfg *config.Config, mode string, port string) *Serv
 	}
 }
 
+// NewCountryFiltered 创建按出口国家过滤的 HTTP 代理服务器。
+func NewCountryFiltered(s *storage.Storage, cfg *config.Config, mode string, port string, countries []string) *Server {
+	server := New(s, cfg, mode, port)
+	server.countryMode = true
+	return server
+}
+
+func normalizeCountryFilter(countries []string) []string {
+	seen := make(map[string]bool, len(countries))
+	filtered := make([]string, 0, len(countries))
+	for _, country := range countries {
+		country = strings.TrimSpace(strings.ToUpper(country))
+		if country == "" || seen[country] {
+			continue
+		}
+		seen[country] = true
+		filtered = append(filtered, country)
+	}
+	return filtered
+}
+
 func (s *Server) Start() error {
 	modeDesc := "随机轮换"
 	if s.mode == "lowest-latency" {
 		modeDesc = "最低延迟"
 	}
+	cfg := config.Get()
+	if cfg == nil {
+		cfg = s.cfg
+	}
+	if s.countryMode {
+		countries := normalizeCountryFilter(cfg.CountryProxyCountries)
+		if len(countries) > 0 {
+			modeDesc = fmt.Sprintf("%s/国家过滤=%s", modeDesc, strings.Join(countries, ","))
+		} else {
+			modeDesc = fmt.Sprintf("%s/国家过滤=未配置", modeDesc)
+		}
+	}
 	authStatus := "无认证"
-	if s.cfg.ProxyAuthEnabled {
-		authStatus = fmt.Sprintf("需认证 (用户: %s)", s.cfg.ProxyAuthUsername)
+	if cfg.ProxyAuthEnabled {
+		authStatus = fmt.Sprintf("需认证 (用户: %s)", cfg.ProxyAuthUsername)
 	}
 	log.Printf("proxy server listening on %s [%s] [%s]", s.port, modeDesc, authStatus)
 	return http.ListenAndServe(s.port, s)
 }
 
+func (s *Server) activeCountryFilter(cfg *config.Config) []string {
+	if s.countryMode || s.port == cfg.CountryProxyPort {
+		return normalizeCountryFilter(cfg.CountryProxyCountries)
+	}
+	return nil
+}
+
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	cfg := config.Get()
+	if cfg == nil {
+		cfg = s.cfg
+	}
 	// 认证检查（如果启用）
-	if s.cfg.ProxyAuthEnabled {
-		if !s.checkAuth(r) {
+	if cfg.ProxyAuthEnabled {
+		if !s.checkAuth(r, cfg) {
 			w.Header().Set("Proxy-Authenticate", `Basic realm="GoProxy"`)
 			http.Error(w, "Proxy Authentication Required", http.StatusProxyAuthRequired)
 			return
 		}
 	}
-	
+
 	if r.Method == http.MethodConnect {
 		s.handleTunnel(w, r)
 	} else {
@@ -65,43 +111,50 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // checkAuth 验证代理 Basic Auth
-func (s *Server) checkAuth(r *http.Request) bool {
+func (s *Server) checkAuth(r *http.Request, cfg *config.Config) bool {
 	auth := r.Header.Get("Proxy-Authorization")
 	if auth == "" {
 		return false
 	}
-	
+
 	// 解析 Basic Auth
 	const prefix = "Basic "
 	if !strings.HasPrefix(auth, prefix) {
 		return false
 	}
-	
+
 	decoded, err := base64.StdEncoding.DecodeString(auth[len(prefix):])
 	if err != nil {
 		return false
 	}
-	
+
 	credentials := strings.SplitN(string(decoded), ":", 2)
 	if len(credentials) != 2 {
 		return false
 	}
-	
+
 	username := credentials[0]
 	password := credentials[1]
-	
+
 	// 验证用户名和密码
-	usernameMatch := subtle.ConstantTimeCompare([]byte(username), []byte(s.cfg.ProxyAuthUsername)) == 1
+	usernameMatch := subtle.ConstantTimeCompare([]byte(username), []byte(cfg.ProxyAuthUsername)) == 1
 	passwordHash := fmt.Sprintf("%x", sha256.Sum256([]byte(password)))
-	passwordMatch := subtle.ConstantTimeCompare([]byte(passwordHash), []byte(s.cfg.ProxyAuthPasswordHash)) == 1
-	
+	passwordMatch := subtle.ConstantTimeCompare([]byte(passwordHash), []byte(cfg.ProxyAuthPasswordHash)) == 1
+
 	return usernameMatch && passwordMatch
 }
 
 // selectProxy 根据使用模式和选择策略获取代理
 func (s *Server) selectProxy(tried []string, lowestLatency bool) (*storage.Proxy, error) {
 	cfg := config.Get()
+	if cfg == nil {
+		cfg = s.cfg
+	}
 	sourceFilter := sourceFilterFromMode(cfg.CustomProxyMode)
+	countryFilter := s.activeCountryFilter(cfg)
+	if s.countryMode || len(countryFilter) > 0 {
+		return s.selectProxyByCountries(tried, countryFilter)
+	}
 
 	// 混用 + 优先模式：先尝试优先源，无可用则 fallback 全部
 	if cfg.CustomProxyMode == "mixed" && (cfg.CustomPriority || cfg.CustomFreePriority) {
@@ -132,6 +185,29 @@ func (s *Server) selectProxy(tried []string, lowestLatency bool) (*storage.Proxy
 	return s.storage.GetRandomExcludeFiltered(tried, sourceFilter)
 }
 
+func (s *Server) selectProxyByCountries(tried []string, countries []string) (*storage.Proxy, error) {
+	cfg := config.Get()
+	if cfg == nil {
+		cfg = s.cfg
+	}
+	if len(countries) == 0 {
+		return nil, fmt.Errorf("country filter is empty")
+	}
+
+	if cfg.CustomProxyMode == "mixed" && (cfg.CustomPriority || cfg.CustomFreePriority) {
+		preferSource := "custom"
+		if cfg.CustomFreePriority {
+			preferSource = "free"
+		}
+		if p, err := s.storage.GetRandomExcludeFilteredByCountries(tried, preferSource, countries); err == nil {
+			return p, nil
+		}
+		return s.storage.GetRandomExcludeFilteredByCountries(tried, "", countries)
+	}
+
+	return s.storage.GetRandomExcludeFilteredByCountries(tried, sourceFilterFromMode(cfg.CustomProxyMode), countries)
+}
+
 // removeOrDisableProxy 根据代理来源决定删除或禁用
 func removeOrDisableProxy(store *storage.Storage, p *storage.Proxy) {
 	if p.Source == "custom" {
@@ -155,8 +231,12 @@ func sourceFilterFromMode(mode string) string {
 
 // handleHTTP 处理普通 HTTP 请求（带自动重试）
 func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
+	cfg := config.Get()
+	if cfg == nil {
+		cfg = s.cfg
+	}
 	var tried []string
-	for attempt := 0; attempt <= s.cfg.MaxRetry; attempt++ {
+	for attempt := 0; attempt <= cfg.MaxRetry; attempt++ {
 		p, err := s.selectProxy(tried, s.mode == "lowest-latency")
 		if err != nil {
 			http.Error(w, "no available proxy", http.StatusServiceUnavailable)
@@ -210,8 +290,12 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 
 // handleTunnel 处理 HTTPS CONNECT 隧道（带自动重试）
 func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
+	cfg := config.Get()
+	if cfg == nil {
+		cfg = s.cfg
+	}
 	var tried []string
-	for attempt := 0; attempt <= s.cfg.MaxRetry; attempt++ {
+	for attempt := 0; attempt <= cfg.MaxRetry; attempt++ {
 		p, err := s.selectProxy(tried, s.mode == "lowest-latency")
 		if err != nil {
 			http.Error(w, "no available proxy", http.StatusServiceUnavailable)
@@ -256,25 +340,27 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) dialViaProxy(p *storage.Proxy, host string) (net.Conn, error) {
-	timeout := time.Duration(s.cfg.ValidateTimeout) * time.Second
+	cfg := config.Get()
+	if cfg == nil {
+		cfg = s.cfg
+	}
+	timeout := time.Duration(cfg.ValidateTimeout) * time.Second
 	switch p.Protocol {
 	case "http":
 		conn, err := net.DialTimeout("tcp", p.Address, timeout)
 		if err != nil {
 			return nil, err
 		}
+		_ = conn.SetDeadline(time.Now().Add(timeout))
 		// 发送 CONNECT 请求给上游 HTTP 代理
 		fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", host, host)
-		buf := make([]byte, 256)
-		n, err := conn.Read(buf)
+		tunnelConn, err := readHTTPConnectResponse(conn)
 		if err != nil {
 			conn.Close()
 			return nil, err
 		}
-		if n < 12 {
-			conn.Close()
-			return nil, fmt.Errorf("short response from proxy")
-		}
+		conn = tunnelConn
+		_ = conn.SetDeadline(time.Time{})
 		return conn, nil
 	case "socks5":
 		dialer, err := proxy.SOCKS5("tcp", p.Address, nil, proxy.Direct)
@@ -287,8 +373,51 @@ func (s *Server) dialViaProxy(p *storage.Proxy, host string) (net.Conn, error) {
 	}
 }
 
+type bufferedConn struct {
+	net.Conn
+	reader *bufio.Reader
+}
+
+func (c *bufferedConn) Read(b []byte) (int, error) {
+	if c.reader.Buffered() > 0 {
+		return c.reader.Read(b)
+	}
+	return c.Conn.Read(b)
+}
+
+func readHTTPConnectResponse(conn net.Conn) (net.Conn, error) {
+	reader := bufio.NewReader(conn)
+	statusLine, err := reader.ReadString('\n')
+	if err != nil {
+		return nil, err
+	}
+	fields := strings.Fields(statusLine)
+	if len(fields) < 2 || !strings.HasPrefix(fields[0], "HTTP/") || fields[1] != "200" {
+		return nil, fmt.Errorf("upstream proxy connect failed: %s", strings.TrimSpace(statusLine))
+	}
+
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return nil, err
+		}
+		if line == "\r\n" || line == "\n" {
+			break
+		}
+	}
+
+	if reader.Buffered() > 0 {
+		return &bufferedConn{Conn: conn, reader: reader}, nil
+	}
+	return conn, nil
+}
+
 func (s *Server) buildClient(p *storage.Proxy) (*http.Client, error) {
-	timeout := time.Duration(s.cfg.ValidateTimeout) * time.Second
+	cfg := config.Get()
+	if cfg == nil {
+		cfg = s.cfg
+	}
+	timeout := time.Duration(cfg.ValidateTimeout) * time.Second
 	switch p.Protocol {
 	case "http":
 		proxyURL, err := url.Parse(fmt.Sprintf("http://%s", p.Address))

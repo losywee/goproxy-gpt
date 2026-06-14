@@ -1,7 +1,10 @@
 package webui
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -13,6 +16,7 @@ import (
 
 	"goproxy/config"
 	"goproxy/custom"
+	"goproxy/fetcher"
 	"goproxy/logger"
 	"goproxy/pool"
 	"goproxy/storage"
@@ -26,7 +30,12 @@ var (
 )
 
 func newSession() string {
-	token := fmt.Sprintf("%x", sha256.Sum256([]byte(fmt.Sprintf("%d", time.Now().UnixNano()))))
+	tokenBytes := make([]byte, 32)
+	if _, err := rand.Read(tokenBytes); err != nil {
+		log.Printf("[webui] 生成 session token 失败: %v", err)
+		return ""
+	}
+	token := base64.RawURLEncoding.EncodeToString(tokenBytes)
 	sessionsMu.Lock()
 	sessions[token] = time.Now().Add(24 * time.Hour)
 	sessionsMu.Unlock()
@@ -39,12 +48,19 @@ func validSession(r *http.Request) bool {
 		return false
 	}
 	sessionsMu.Lock()
+	defer sessionsMu.Unlock()
 	expiry, ok := sessions[cookie.Value]
-	sessionsMu.Unlock()
-	return ok && time.Now().Before(expiry)
+	if !ok || !time.Now().Before(expiry) {
+		if ok {
+			delete(sessions, cookie.Value)
+		}
+		return false
+	}
+	return true
 }
 
 type FetchTrigger func()
+type SourceRefreshTrigger func(sourceURL, protocol string)
 
 type Server struct {
 	storage       *storage.Storage
@@ -52,34 +68,36 @@ type Server struct {
 	poolMgr       *pool.Manager
 	customMgr     *custom.Manager
 	fetchTrigger  FetchTrigger
+	sourceRefresh SourceRefreshTrigger
 	configChanged chan<- struct{}
 }
 
-func New(s *storage.Storage, cfg *config.Config, pm *pool.Manager, cm *custom.Manager, ft FetchTrigger, cc chan<- struct{}) *Server {
+func New(s *storage.Storage, cfg *config.Config, pm *pool.Manager, cm *custom.Manager, ft FetchTrigger, srt SourceRefreshTrigger, cc chan<- struct{}) *Server {
 	return &Server{
 		storage:       s,
 		cfg:           cfg,
 		poolMgr:       pm,
 		customMgr:     cm,
 		fetchTrigger:  ft,
+		sourceRefresh: srt,
 		configChanged: cc,
 	}
 }
 
 func (s *Server) Start() {
 	mux := http.NewServeMux()
-	
+
 	// 添加日志中间件
 	loggedMux := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("[webui] %s %s | Host: %s | RemoteAddr: %s", 
+		log.Printf("[webui] %s %s | Host: %s | RemoteAddr: %s",
 			r.Method, r.URL.Path, r.Host, r.RemoteAddr)
 		mux.ServeHTTP(w, r)
 	})
-	
+
 	mux.HandleFunc("/", s.handleIndex)
 	mux.HandleFunc("/login", s.handleLogin)
 	mux.HandleFunc("/logout", s.handleLogout)
-	
+
 	// 只读 API（访客可访问）
 	mux.HandleFunc("/api/stats", s.readOnlyMiddleware(s.apiStats))
 	mux.HandleFunc("/api/proxies", s.readOnlyMiddleware(s.apiProxies))
@@ -88,11 +106,15 @@ func (s *Server) Start() {
 	mux.HandleFunc("/api/pool/quality", s.readOnlyMiddleware(s.apiQualityDistribution))
 	mux.HandleFunc("/api/config", s.readOnlyMiddleware(s.apiConfig))
 	mux.HandleFunc("/api/auth/check", s.apiAuthCheck) // 检查登录状态
-	
+
 	// 管理员 API（需要登录）
 	mux.HandleFunc("/api/proxy/delete", s.authMiddleware(s.apiDeleteProxy))
 	mux.HandleFunc("/api/proxy/refresh", s.authMiddleware(s.apiRefreshProxy))
 	mux.HandleFunc("/api/fetch", s.authMiddleware(s.apiFetch))
+	mux.HandleFunc("/api/sources", s.authMiddleware(s.apiSources))
+	mux.HandleFunc("/api/source/add", s.authMiddleware(s.apiSourceAdd))
+	mux.HandleFunc("/api/source/delete", s.authMiddleware(s.apiSourceDelete))
+	mux.HandleFunc("/api/source/refresh", s.authMiddleware(s.apiSourceRefresh))
 	mux.HandleFunc("/api/refresh-latency", s.authMiddleware(s.apiRefreshLatency))
 	mux.HandleFunc("/api/config/save", s.authMiddleware(s.apiConfigSave))
 
@@ -151,18 +173,25 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	password := r.FormValue("password")
 	hash := fmt.Sprintf("%x", sha256.Sum256([]byte(password)))
-	if hash != s.cfg.WebUIPasswordHash {
+	if subtle.ConstantTimeCompare([]byte(hash), []byte(config.Get().WebUIPasswordHash)) != 1 {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		fmt.Fprint(w, loginHTMLWithError)
 		return
 	}
 	token := newSession()
+	if token == "" {
+		http.Error(w, "failed to create session", http.StatusInternalServerError)
+		return
+	}
+	secureCookie := r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https"
 	http.SetCookie(w, &http.Cookie{
 		Name:     "session",
 		Value:    token,
 		Path:     "/",
 		Expires:  time.Now().Add(24 * time.Hour),
 		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   secureCookie,
 	})
 	http.Redirect(w, r, "/", http.StatusFound)
 }
@@ -173,7 +202,7 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 		delete(sessions, cookie.Value)
 		sessionsMu.Unlock()
 	}
-	http.SetCookie(w, &http.Cookie{Name: "session", Value: "", Path: "/", MaxAge: -1})
+	http.SetCookie(w, &http.Cookie{Name: "session", Value: "", Path: "/", MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteLaxMode})
 	http.Redirect(w, r, "/login", http.StatusFound)
 }
 
@@ -182,7 +211,7 @@ func (s *Server) apiAuthCheck(w http.ResponseWriter, r *http.Request) {
 	isAdmin := validSession(r)
 	jsonOK(w, map[string]interface{}{
 		"isAdmin": isAdmin,
-		"mode":    func() string {
+		"mode": func() string {
 			if isAdmin {
 				return "admin"
 			}
@@ -256,7 +285,7 @@ func (s *Server) apiRefreshProxy(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "failed to get proxy", http.StatusInternalServerError)
 		return
 	}
-	
+
 	var targetProxy *storage.Proxy
 	for i := range proxies {
 		if proxies[i].Address == req.Address {
@@ -264,7 +293,7 @@ func (s *Server) apiRefreshProxy(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
-	
+
 	if targetProxy == nil {
 		jsonError(w, "proxy not found", http.StatusNotFound)
 		return
@@ -274,10 +303,10 @@ func (s *Server) apiRefreshProxy(w http.ResponseWriter, r *http.Request) {
 	go func() {
 		cfg := config.Get()
 		v := validator.New(1, cfg.ValidateTimeout, cfg.ValidateURL)
-		
+
 		log.Printf("[webui] refreshing proxy: %s", req.Address)
 		valid, latency, exitIP, exitLocation := v.ValidateOne(*targetProxy)
-		
+
 		if valid {
 			latencyMs := int(latency.Milliseconds())
 			s.storage.UpdateExitInfo(req.Address, exitIP, exitLocation, latencyMs)
@@ -303,6 +332,168 @@ func (s *Server) apiFetch(w http.ResponseWriter, r *http.Request) {
 	}
 	go s.fetchTrigger()
 	jsonOK(w, map[string]string{"status": "fetch started"})
+}
+
+func normalizeSourceInput(sourceURL, protocol string) (config.SourceConfig, error) {
+	sources := config.NormalizeCustomSources([]config.SourceConfig{{URL: sourceURL, Protocol: protocol}})
+	if len(sources) == 0 {
+		return config.SourceConfig{}, fmt.Errorf("invalid source")
+	}
+	return sources[0], nil
+}
+
+func sourceExists(sources []config.SourceConfig, target config.SourceConfig) bool {
+	for _, source := range sources {
+		if source.URL == target.URL && source.Protocol == target.Protocol {
+			return true
+		}
+	}
+	return false
+}
+
+func builtinSourceExists(target config.SourceConfig) bool {
+	for _, source := range fetcher.BuiltinSources() {
+		if source.URL == target.URL && source.Protocol == target.Protocol {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) apiSources(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	cfg := config.Get()
+	customSources := config.NormalizeCustomSources(cfg.CustomSources)
+	customSet := make(map[string]bool, len(customSources))
+	for _, source := range customSources {
+		customSet[source.Protocol+"\n"+source.URL] = true
+	}
+
+	type sourceView struct {
+		URL      string `json:"url"`
+		Protocol string `json:"protocol"`
+		Custom   bool   `json:"custom"`
+	}
+	sources := make([]sourceView, 0, len(fetcher.BuiltinSources())+len(customSources))
+	builtinSet := make(map[string]bool, len(fetcher.BuiltinSources()))
+	for _, source := range fetcher.BuiltinSources() {
+		key := source.Protocol + "\n" + source.URL
+		builtinSet[key] = true
+		sources = append(sources, sourceView{URL: source.URL, Protocol: source.Protocol, Custom: customSet[key]})
+	}
+	for _, source := range customSources {
+		if builtinSet[source.Protocol+"\n"+source.URL] {
+			continue
+		}
+		sources = append(sources, sourceView{URL: source.URL, Protocol: source.Protocol, Custom: true})
+	}
+	jsonOK(w, sources)
+}
+
+func (s *Server) apiSourceAdd(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		URL      string `json:"url"`
+		Protocol string `json:"protocol"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+	source, err := normalizeSourceInput(req.URL, req.Protocol)
+	if err != nil {
+		jsonError(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	cfg := config.Get()
+	customSources := config.NormalizeCustomSources(cfg.CustomSources)
+	if sourceExists(customSources, source) || builtinSourceExists(source) {
+		jsonError(w, "source already exists", http.StatusBadRequest)
+		return
+	}
+	newCfg := *cfg
+	newCfg.CustomSources = append(customSources, source)
+	if err := config.Save(&newCfg); err != nil {
+		jsonError(w, "save config error: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	log.Printf("[source] 添加自定义来源: %s (%s)", source.URL, source.Protocol)
+	jsonOK(w, map[string]string{"status": "added"})
+}
+
+func (s *Server) apiSourceDelete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		URL      string `json:"url"`
+		Protocol string `json:"protocol"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+	target, err := normalizeSourceInput(req.URL, req.Protocol)
+	if err != nil {
+		jsonError(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	cfg := config.Get()
+	customSources := config.NormalizeCustomSources(cfg.CustomSources)
+	nextSources := make([]config.SourceConfig, 0, len(customSources))
+	deleted := false
+	for _, source := range customSources {
+		if source.URL == target.URL && source.Protocol == target.Protocol {
+			deleted = true
+			continue
+		}
+		nextSources = append(nextSources, source)
+	}
+	if !deleted {
+		jsonError(w, "custom source not found", http.StatusNotFound)
+		return
+	}
+	newCfg := *cfg
+	newCfg.CustomSources = nextSources
+	if err := config.Save(&newCfg); err != nil {
+		jsonError(w, "save config error: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	log.Printf("[source] 删除自定义来源: %s (%s)", target.URL, target.Protocol)
+	jsonOK(w, map[string]string{"status": "deleted"})
+}
+
+func (s *Server) apiSourceRefresh(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		URL      string `json:"url"`
+		Protocol string `json:"protocol"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+	source, err := normalizeSourceInput(req.URL, req.Protocol)
+	if err != nil {
+		jsonError(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if s.sourceRefresh == nil {
+		jsonError(w, "source refresh unavailable", http.StatusInternalServerError)
+		return
+	}
+	s.sourceRefresh(source.URL, source.Protocol)
+	jsonOK(w, map[string]string{"status": "refresh started"})
 }
 
 func (s *Server) apiRefreshLatency(w http.ResponseWriter, r *http.Request) {
@@ -354,35 +545,46 @@ func (s *Server) apiLogs(w http.ResponseWriter, r *http.Request) {
 func (s *Server) apiConfig(w http.ResponseWriter, r *http.Request) {
 	cfg := config.Get()
 	httpSlots, socks5Slots := cfg.CalculateSlots()
-	
+
 	jsonOK(w, map[string]interface{}{
 		// 池子配置
-		"pool_max_size":        cfg.PoolMaxSize,
-		"pool_http_ratio":      cfg.PoolHTTPRatio,
+		"pool_max_size":         cfg.PoolMaxSize,
+		"pool_http_ratio":       cfg.PoolHTTPRatio,
 		"pool_min_per_protocol": cfg.PoolMinPerProtocol,
-		"pool_http_slots":      httpSlots,
-		"pool_socks5_slots":    socks5Slots,
+		"pool_http_slots":       httpSlots,
+		"pool_socks5_slots":     socks5Slots,
 
 		// 延迟配置
-		"max_latency_ms":         cfg.MaxLatencyMs,
-		"max_latency_emergency":  cfg.MaxLatencyEmergency,
-		"max_latency_healthy":    cfg.MaxLatencyHealthy,
+		"max_latency_ms":        cfg.MaxLatencyMs,
+		"max_latency_emergency": cfg.MaxLatencyEmergency,
+		"max_latency_healthy":   cfg.MaxLatencyHealthy,
 
 		// 验证配置
-		"validate_concurrency":   cfg.ValidateConcurrency,
-		"validate_timeout":       cfg.ValidateTimeout,
+		"validate_concurrency": cfg.ValidateConcurrency,
+		"validate_timeout":     cfg.ValidateTimeout,
 
 		// 健康检查配置
-		"health_check_interval":  cfg.HealthCheckInterval,
-		"health_check_batch_size": cfg.HealthCheckBatchSize,
+		"health_check_interval":    cfg.HealthCheckInterval,
+		"health_check_batch_size":  cfg.HealthCheckBatchSize,
+		"health_check_concurrency": cfg.HealthCheckConcurrency,
 
 		// 优化配置
-		"optimize_interval":      cfg.OptimizeInterval,
-		"replace_threshold":      cfg.ReplaceThreshold,
+		"optimize_interval":    cfg.OptimizeInterval,
+		"optimize_concurrency": cfg.OptimizeConcurrency,
+		"replace_threshold":    cfg.ReplaceThreshold,
+
+		// IP 查询和源管理配置
+		"ip_query_rate_limit":      cfg.IPQueryRateLimit,
+		"source_fail_threshold":    cfg.SourceFailThreshold,
+		"source_disable_threshold": cfg.SourceDisableThreshold,
+		"source_cooldown_minutes":  cfg.SourceCooldownMinutes,
 
 		// 地理过滤配置
-		"blocked_countries":      cfg.BlockedCountries,
-		"allowed_countries":      cfg.AllowedCountries,
+		"blocked_countries":       cfg.BlockedCountries,
+		"allowed_countries":       cfg.AllowedCountries,
+		"country_proxy_port":      cfg.CountryProxyPort,
+		"country_socks5_port":     cfg.CountrySOCKS5Port,
+		"country_proxy_countries": cfg.CountryProxyCountries,
 
 		// 自定义订阅代理配置
 		"custom_proxy_mode":       cfg.CustomProxyMode,
@@ -401,25 +603,32 @@ func (s *Server) apiConfigSave(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		PoolMaxSize           int      `json:"pool_max_size"`
-		PoolHTTPRatio         float64  `json:"pool_http_ratio"`
-		PoolMinPerProtocol    int      `json:"pool_min_per_protocol"`
-		MaxLatencyMs          int      `json:"max_latency_ms"`
-		MaxLatencyEmergency   int      `json:"max_latency_emergency"`
-		MaxLatencyHealthy     int      `json:"max_latency_healthy"`
-		ValidateConcurrency   int      `json:"validate_concurrency"`
-		ValidateTimeout       int      `json:"validate_timeout"`
-		HealthCheckInterval   int      `json:"health_check_interval"`
-		HealthCheckBatchSize  int      `json:"health_check_batch_size"`
-		OptimizeInterval      int      `json:"optimize_interval"`
-		ReplaceThreshold      float64  `json:"replace_threshold"`
-		BlockedCountries      []string `json:"blocked_countries"`
-		AllowedCountries      []string `json:"allowed_countries"`
-		CustomProxyMode       string   `json:"custom_proxy_mode"`
-		CustomPriority        *bool    `json:"custom_priority"`
-		CustomFreePriority    *bool    `json:"custom_free_priority"`
-		CustomProbeInterval   int      `json:"custom_probe_interval"`
-		CustomRefreshInterval int      `json:"custom_refresh_interval"`
+		PoolMaxSize            int      `json:"pool_max_size"`
+		PoolHTTPRatio          float64  `json:"pool_http_ratio"`
+		PoolMinPerProtocol     int      `json:"pool_min_per_protocol"`
+		MaxLatencyMs           int      `json:"max_latency_ms"`
+		MaxLatencyEmergency    int      `json:"max_latency_emergency"`
+		MaxLatencyHealthy      int      `json:"max_latency_healthy"`
+		ValidateConcurrency    int      `json:"validate_concurrency"`
+		ValidateTimeout        int      `json:"validate_timeout"`
+		HealthCheckInterval    int      `json:"health_check_interval"`
+		HealthCheckBatchSize   int      `json:"health_check_batch_size"`
+		HealthCheckConcurrency int      `json:"health_check_concurrency"`
+		OptimizeInterval       int      `json:"optimize_interval"`
+		OptimizeConcurrency    int      `json:"optimize_concurrency"`
+		ReplaceThreshold       float64  `json:"replace_threshold"`
+		IPQueryRateLimit       int      `json:"ip_query_rate_limit"`
+		SourceFailThreshold    int      `json:"source_fail_threshold"`
+		SourceDisableThreshold int      `json:"source_disable_threshold"`
+		SourceCooldownMinutes  int      `json:"source_cooldown_minutes"`
+		BlockedCountries       []string `json:"blocked_countries"`
+		AllowedCountries       []string `json:"allowed_countries"`
+		CountryProxyCountries  []string `json:"country_proxy_countries"`
+		CustomProxyMode        string   `json:"custom_proxy_mode"`
+		CustomPriority         *bool    `json:"custom_priority"`
+		CustomFreePriority     *bool    `json:"custom_free_priority"`
+		CustomProbeInterval    int      `json:"custom_probe_interval"`
+		CustomRefreshInterval  int      `json:"custom_refresh_interval"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -450,10 +659,29 @@ func (s *Server) apiConfigSave(w http.ResponseWriter, r *http.Request) {
 	newCfg.ValidateTimeout = req.ValidateTimeout
 	newCfg.HealthCheckInterval = req.HealthCheckInterval
 	newCfg.HealthCheckBatchSize = req.HealthCheckBatchSize
+	if req.HealthCheckConcurrency > 0 {
+		newCfg.HealthCheckConcurrency = req.HealthCheckConcurrency
+	}
 	newCfg.OptimizeInterval = req.OptimizeInterval
+	if req.OptimizeConcurrency > 0 {
+		newCfg.OptimizeConcurrency = req.OptimizeConcurrency
+	}
 	newCfg.ReplaceThreshold = req.ReplaceThreshold
+	if req.IPQueryRateLimit > 0 {
+		newCfg.IPQueryRateLimit = req.IPQueryRateLimit
+	}
+	if req.SourceFailThreshold > 0 {
+		newCfg.SourceFailThreshold = req.SourceFailThreshold
+	}
+	if req.SourceDisableThreshold > 0 {
+		newCfg.SourceDisableThreshold = req.SourceDisableThreshold
+	}
+	if req.SourceCooldownMinutes > 0 {
+		newCfg.SourceCooldownMinutes = req.SourceCooldownMinutes
+	}
 	newCfg.BlockedCountries = req.BlockedCountries
 	newCfg.AllowedCountries = req.AllowedCountries
+	newCfg.CountryProxyCountries = req.CountryProxyCountries
 	if req.CustomProxyMode != "" {
 		newCfg.CustomProxyMode = req.CustomProxyMode
 	}

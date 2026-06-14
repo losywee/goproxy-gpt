@@ -42,8 +42,10 @@ GoProxy 从公开代理源自动抓取 HTTP/SOCKS5 代理，同时支持导入 C
 |------|------|------|---------|
 | 7777 | HTTP | 随机轮换 | 爬虫、数据采集、IP 多样性 |
 | 7776 | HTTP | 最低延迟 | 长连接、流媒体、稳定优先 |
+| 7781 | HTTP | 国家过滤随机轮换 | 仅使用指定出口国家 |
 | 7779 | SOCKS5 | 随机轮换 | 浏览器、SSH、游戏 |
 | 7780 | SOCKS5 | 最低延迟 | 稳定应用、固定连接 |
+| 7782 | SOCKS5 | 国家过滤随机轮换 | 仅使用指定出口国家 |
 | 7778 | HTTP | WebUI | 管理面板（双角色权限） |
 
 ### WebUI 仪表盘
@@ -51,6 +53,7 @@ GoProxy 从公开代理源自动抓取 HTTP/SOCKS5 代理，同时支持导入 C
 - 免费池 / 订阅池分离展示，实时状态监控
 - 订阅管理：添加 URL / 上传文件 / 刷新 / 暂停 / 删除
 - 系统设置：5 种代理模式切换、池子参数、地理过滤
+- 来源管理：手动添加/删除公开代理源，并可单独刷新某个来源
 - 双角色权限：访客只读 + 管理员完全控制
 - 中英文切换
 
@@ -97,6 +100,9 @@ curl -x http://localhost:7777 https://httpbin.org/ip
 # 最低延迟（稳定优先）
 curl -x http://localhost:7776 https://httpbin.org/ip
 
+# 国家过滤（默认 7781，国家列表通过 WebUI 或 COUNTRY_PROXY_COUNTRIES 配置）
+curl -x http://localhost:7781 https://httpbin.org/ip
+
 # 环境变量方式
 export http_proxy=http://localhost:7777
 export https_proxy=http://localhost:7777
@@ -110,6 +116,9 @@ curl --socks5 localhost:7779 https://httpbin.org/ip
 
 # 最低延迟
 curl --socks5 localhost:7780 https://httpbin.org/ip
+
+# 国家过滤（默认 7782，国家列表通过 WebUI 或 COUNTRY_PROXY_COUNTRIES 配置）
+curl --socks5 localhost:7782 https://httpbin.org/ip
 
 # 环境变量方式
 export ALL_PROXY=socks5://localhost:7779
@@ -183,7 +192,7 @@ ssh -o ProxyCommand='nc -X 5 -x localhost:7779 %h %p' user@remote-server
 
 ```bash
 docker run -d --name proxygo \
-  -p 7776:7776 -p 7777:7777 -p 7778:7778 -p 7779:7779 -p 7780:7780 \
+  -p 7776:7776 -p 7777:7777 -p 7778:7778 -p 7779:7779 -p 7780:7780 -p 7781:7781 -p 7782:7782 \
   -e WEBUI_PASSWORD=your_password \
   -e PROXY_AUTH_ENABLED=true \
   -e PROXY_AUTH_USERNAME=myuser \
@@ -229,6 +238,8 @@ docker compose up -d
 | `PROXY_AUTH_PASSWORD` | 空 | 否 | 代理认证密码，启用认证时必填 |
 | `BLOCKED_COUNTRIES` | `CN` | 否 | 屏蔽国家代码（逗号分隔，留空不屏蔽） |
 | `ALLOWED_COUNTRIES` | 空 | 否 | 允许国家白名单（非空时优先于黑名单） |
+| `COUNTRY_PROXY_COUNTRIES` | 空 | 否 | 7781/7782 国家过滤端口允许的出口国家代码，逗号分隔 |
+| `COUNTRY_SOCKS5_PORT` | `7782` | 否 | SOCKS5 国家过滤端口，仅启动时生效 |
 | `CUSTOM_PROXY_MODE` | `mixed` | 否 | 代理模式：mixed / custom_only / free_only |
 | `SINGBOX_PATH` | `sing-box` | 否 | sing-box 路径（Docker 内置，无需修改） |
 | `TZ` | `Asia/Shanghai` | 否 | 时区 |
@@ -250,7 +261,7 @@ main.go                    # 入口，协调所有模块
 │   ├── parser.go          #   格式自动识别解析
 │   ├── singbox.go         #   sing-box 进程管理
 │   └── manager.go         #   刷新循环 + 探测唤醒 + 过期清理
-├── proxy/                 # 代理服务（HTTP + SOCKS5，4 端口）
+├── proxy/                 # 代理服务（HTTP + SOCKS5，含国家过滤端口）
 ├── webui/                 # 管理面板（嵌入式 HTML + REST API）
 └── logger/                # 日志收集
 ```

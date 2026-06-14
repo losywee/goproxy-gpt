@@ -7,7 +7,6 @@ import (
 	"log"
 	"net"
 	"net/url"
-	"os"
 	"strconv"
 	"strings"
 
@@ -127,8 +126,8 @@ func looksLikeProxyLinks(s string) bool {
 
 // clashConfig Clash YAML 配置结构（兼容新旧格式）
 type clashConfig struct {
-	Proxies    []map[string]interface{} `yaml:"proxies"`
-	ProxyOld   []map[string]interface{} `yaml:"Proxy"`    // 旧版 Clash 格式
+	Proxies  []map[string]interface{} `yaml:"proxies"`
+	ProxyOld []map[string]interface{} `yaml:"Proxy"` // 旧版 Clash 格式
 }
 
 // getProxies 兼容获取代理列表
@@ -214,11 +213,6 @@ func extractProxiesFromNode(doc *yaml.Node) []map[string]interface{} {
 		if keyNode.Value == "proxies" || keyNode.Value == "Proxy" {
 			log.Printf("[custom] 找到 %s 字段: kind=%d tag=%s 子节点数=%d",
 				keyNode.Value, valNode.Kind, valNode.Tag, len(valNode.Content))
-
-			// 把 proxies 段的原始 YAML 写到临时文件方便调试
-			debugData, _ := yaml.Marshal(valNode)
-			os.WriteFile("/tmp/goproxy_debug_proxies.yaml", debugData, 0644)
-			log.Printf("[custom] 调试: proxies 原始数据已写入 /tmp/goproxy_debug_proxies.yaml (%d bytes)", len(debugData))
 
 			if valNode.Kind != yaml.SequenceNode {
 				log.Printf("[custom] proxies 字段不是列表（kind=%d tag=%s）", valNode.Kind, valNode.Tag)
@@ -321,7 +315,7 @@ func parseClashProxy(proxy map[string]interface{}) (*ParsedNode, error) {
 		"shadowsocks": true, "shadowsocksr": true,
 		"hysteria": true, "hysteria2": true, "tuic": true,
 		"anytls": true,
-		"http": true, "socks5": true,
+		"http":   true, "socks5": true,
 	}
 	if !supported[typ] {
 		return nil, fmt.Errorf("不支持的代理类型: %s", typ)
@@ -472,13 +466,13 @@ func parseVmessLink(link string) (*ParsedNode, error) {
 
 	// 构建 Clash 兼容的 raw 配置
 	raw := map[string]interface{}{
-		"type":   "vmess",
-		"name":   name,
-		"server": server,
-		"port":   port,
-		"uuid":   fmt.Sprintf("%v", info["id"]),
+		"type":    "vmess",
+		"name":    name,
+		"server":  server,
+		"port":    port,
+		"uuid":    fmt.Sprintf("%v", info["id"]),
 		"alterId": getInt(info, "aid"),
-		"cipher": getStrDefault(info, "scy", "auto"),
+		"cipher":  getStrDefault(info, "scy", "auto"),
 	}
 
 	// TLS

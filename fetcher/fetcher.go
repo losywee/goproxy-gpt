@@ -9,13 +9,14 @@ import (
 	"strings"
 	"time"
 
+	"goproxy/config"
 	"goproxy/storage"
 )
 
 // 代理来源定义
 type Source struct {
-	URL      string
-	Protocol string // http 或 socks5
+	URL      string `json:"url"`
+	Protocol string `json:"protocol"` // http 或 socks5
 }
 
 // 快速更新源（5-30分钟更新）- 用于紧急和补充模式
@@ -88,6 +89,58 @@ func New(httpURL, socks5URL string, sourceManager *SourceManager) *Fetcher {
 	}
 }
 
+// BuiltinSources 返回内置来源列表（用于 WebUI 展示）。
+func BuiltinSources() []Source {
+	return append([]Source(nil), allSources...)
+}
+
+func customSourcesFromConfig() []Source {
+	cfg := config.Get()
+	if cfg == nil {
+		return nil
+	}
+	customSources := config.NormalizeCustomSources(cfg.CustomSources)
+	sources := make([]Source, 0, len(customSources))
+	for _, source := range customSources {
+		sources = append(sources, Source{URL: source.URL, Protocol: source.Protocol})
+	}
+	return sources
+}
+
+func mergeSources(base []Source, custom []Source) []Source {
+	merged := make([]Source, 0, len(base)+len(custom))
+	seen := make(map[string]bool, len(base)+len(custom))
+	for _, source := range append(base, custom...) {
+		source.URL = strings.TrimSpace(source.URL)
+		source.Protocol = strings.TrimSpace(strings.ToLower(source.Protocol))
+		if source.Protocol == "socks4" {
+			source.Protocol = "socks5"
+		}
+		if source.URL == "" || (source.Protocol != "http" && source.Protocol != "socks5") {
+			continue
+		}
+		key := source.Protocol + "\n" + source.URL
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		merged = append(merged, source)
+	}
+	return merged
+}
+
+func allSourcesWithCustom() []Source {
+	return mergeSources(allSources, customSourcesFromConfig())
+}
+
+func fastSourcesWithCustom() []Source {
+	return mergeSources(fastUpdateSources, customSourcesFromConfig())
+}
+
+func slowSourcesWithCustom() []Source {
+	return mergeSources(slowUpdateSources, customSourcesFromConfig())
+}
+
 // FetchSmart 智能抓取：根据模式和协议需求选择源
 func (f *Fetcher) FetchSmart(mode string, preferredProtocol string) ([]storage.Proxy, error) {
 	var sources []Source
@@ -95,21 +148,21 @@ func (f *Fetcher) FetchSmart(mode string, preferredProtocol string) ([]storage.P
 	switch mode {
 	case "emergency":
 		// 紧急模式：忽略断路器，强制使用所有源（包括被禁用的）
-		sources = f.filterAvailableSources(allSources, preferredProtocol, true)
+		sources = f.filterAvailableSources(allSourcesWithCustom(), preferredProtocol, true)
 		log.Printf("[fetch] 🚨 紧急模式: 使用 %d 个源（忽略断路器）", len(sources))
 
 	case "refill":
 		// 补充模式：使用快更新源
-		sources = f.filterAvailableSources(fastUpdateSources, preferredProtocol, false)
+		sources = f.filterAvailableSources(fastSourcesWithCustom(), preferredProtocol, false)
 		log.Printf("[fetch] 🔄 补充模式: 使用 %d 个快更新源", len(sources))
 
 	case "optimize":
 		// 优化模式：随机选择2-3个慢更新源
-		sources = f.selectRandomSources(slowUpdateSources, 3, preferredProtocol)
+		sources = f.selectRandomSources(slowSourcesWithCustom(), 3, preferredProtocol)
 		log.Printf("[fetch] ⚡ 优化模式: 使用 %d 个源", len(sources))
 
 	default:
-		sources = f.filterAvailableSources(fastUpdateSources, preferredProtocol, false)
+		sources = f.filterAvailableSources(fastSourcesWithCustom(), preferredProtocol, false)
 	}
 
 	if len(sources) == 0 {
@@ -117,6 +170,36 @@ func (f *Fetcher) FetchSmart(mode string, preferredProtocol string) ([]storage.P
 	}
 
 	return f.fetchFromSources(sources)
+}
+
+// FetchSource 手动刷新单个来源。
+func (f *Fetcher) FetchSource(source Source) ([]storage.Proxy, error) {
+	source.URL = strings.TrimSpace(source.URL)
+	source.Protocol = strings.TrimSpace(strings.ToLower(source.Protocol))
+	if source.Protocol == "socks4" {
+		source.Protocol = "socks5"
+	}
+	if source.URL == "" || (source.Protocol != "http" && source.Protocol != "socks5") {
+		return nil, fmt.Errorf("invalid source")
+	}
+	proxies, err := f.fetchFromURL(source.URL, source.Protocol)
+	if err != nil {
+		if f.sourceManager != nil {
+			cfg := config.Get()
+			failThreshold, disableThreshold, cooldownMinutes := 3, 5, 30
+			if cfg != nil {
+				failThreshold = cfg.SourceFailThreshold
+				disableThreshold = cfg.SourceDisableThreshold
+				cooldownMinutes = cfg.SourceCooldownMinutes
+			}
+			f.sourceManager.RecordFail(source.URL, failThreshold, disableThreshold, cooldownMinutes)
+		}
+		return nil, err
+	}
+	if f.sourceManager != nil {
+		f.sourceManager.RecordSuccess(source.URL)
+	}
+	return proxies, nil
 }
 
 // filterAvailableSources 过滤可用的源（通过断路器）
@@ -178,7 +261,14 @@ func (f *Fetcher) fetchFromSources(sources []Source) ([]storage.Proxy, error) {
 		if r.err != nil {
 			log.Printf("[fetch] ❌ %s error: %v", r.source.URL, r.err)
 			if f.sourceManager != nil {
-				f.sourceManager.RecordFail(r.source.URL, 3, 5, 30)
+				cfg := config.Get()
+				failThreshold, disableThreshold, cooldownMinutes := 3, 5, 30
+				if cfg != nil {
+					failThreshold = cfg.SourceFailThreshold
+					disableThreshold = cfg.SourceDisableThreshold
+					cooldownMinutes = cfg.SourceCooldownMinutes
+				}
+				f.sourceManager.RecordFail(r.source.URL, failThreshold, disableThreshold, cooldownMinutes)
 			}
 			continue
 		}

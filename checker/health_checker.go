@@ -31,6 +31,10 @@ func NewHealthChecker(s *storage.Storage, v *validator.Validator, cfg *config.Co
 func (hc *HealthChecker) RunOnce() {
 	start := time.Now()
 	log.Println("[health] 开始健康检查...")
+	cfg := config.Get()
+	if cfg == nil {
+		cfg = hc.cfg
+	}
 
 	// 获取池子状态
 	status, err := hc.poolMgr.GetStatus()
@@ -49,7 +53,7 @@ func (hc *HealthChecker) RunOnce() {
 	}
 
 	// 批量获取需要检查的代理
-	proxies, err := hc.storage.GetBatchForHealthCheck(hc.cfg.HealthCheckBatchSize, skipSGrade)
+	proxies, err := hc.storage.GetBatchForHealthCheck(cfg.HealthCheckBatchSize, skipSGrade)
 	if err != nil {
 		log.Printf("[health] 获取检查批次失败: %v", err)
 		return
@@ -67,7 +71,11 @@ func (hc *HealthChecker) RunOnce() {
 	removeCount := 0
 	updateCount := 0
 
-	for result := range hc.validator.ValidateStream(proxies) {
+	validate := hc.validator
+	if cfg.HealthCheckConcurrency > 0 {
+		validate = validator.New(cfg.HealthCheckConcurrency, cfg.ValidateTimeout, cfg.ValidateURL)
+	}
+	for result := range validate.ValidateStream(proxies) {
 		if result.Valid {
 			validCount++
 			// 更新延迟和质量等级
@@ -98,11 +106,19 @@ func (hc *HealthChecker) RunOnce() {
 
 // StartBackground 后台定时健康检查
 func (hc *HealthChecker) StartBackground() {
-	ticker := time.NewTicker(time.Duration(hc.cfg.HealthCheckInterval) * time.Minute)
 	go func() {
-		for range ticker.C {
+		for {
+			cfg := config.Get()
+			if cfg == nil {
+				cfg = hc.cfg
+			}
+			time.Sleep(time.Duration(cfg.HealthCheckInterval) * time.Minute)
 			hc.RunOnce()
 		}
 	}()
-	log.Printf("[health] 健康检查器已启动，间隔 %d 分钟", hc.cfg.HealthCheckInterval)
+	cfg := config.Get()
+	if cfg == nil {
+		cfg = hc.cfg
+	}
+	log.Printf("[health] 健康检查器已启动，间隔 %d 分钟", cfg.HealthCheckInterval)
 }

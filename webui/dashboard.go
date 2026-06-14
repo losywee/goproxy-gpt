@@ -400,6 +400,28 @@ tr:hover{background:var(--gray-2);box-shadow:inset 0 0 20px rgba(0,255,65,0.05)}
       </div>
     </div>
 
+    <!-- 代理来源管理 -->
+    <div class="form-section">
+      <div class="form-section-title" data-i18n="config.section_sources">代理来源</div>
+      <div class="form-grid">
+        <div class="form-group" style="grid-column:1/-1">
+          <label data-i18n="source.add_title">添加来源</label>
+          <div style="display:grid;grid-template-columns:1fr 110px 90px;gap:8px">
+            <input type="text" id="source-url" placeholder="https://example.com/proxies.txt">
+            <select id="source-protocol" style="padding:10px;background:var(--bg-card);border:1px solid var(--border);color:var(--fg);font-family:var(--mono);font-size:12px">
+              <option value="http">HTTP</option>
+              <option value="socks5">SOCKS5</option>
+            </select>
+            <button class="ctrl-btn-primary" onclick="addSource()" data-i18n="source.add_btn">添加</button>
+          </div>
+          <div class="form-help" data-i18n="source.help">手动来源会保存到 config.json，并参与后续抓取；内置来源只能刷新，不能删除</div>
+        </div>
+        <div class="form-group" style="grid-column:1/-1">
+          <div id="source-list" style="max-height:220px;overflow-y:auto;border:1px solid var(--border);padding:8px;background:var(--bg-card);font-size:10px"></div>
+        </div>
+      </div>
+    </div>
+
     <!-- 订阅池设置 -->
     <div class="form-section">
       <div class="form-section-title" data-i18n="config.section_sub_pool">订阅代理池</div>
@@ -453,6 +475,11 @@ tr:hover{background:var(--gray-2);box-shadow:inset 0 0 20px rgba(0,255,65,0.05)}
           <label data-i18n="config.blocked_countries">屏蔽国家（黑名单）</label>
           <input type="text" id="cfg-blocked-countries" placeholder="CN,RU,KP">
           <div class="form-help" data-i18n="config.blocked_countries_help">白名单为空时生效</div>
+        </div>
+        <div class="form-group" style="grid-column:1/-1">
+          <label data-i18n="config.country_proxy_countries">7781/7782 端口国家过滤</label>
+          <input type="text" id="cfg-country-proxy-countries" placeholder="US,JP,SG">
+          <div class="form-help" data-i18n="config.country_proxy_countries_help">7781 HTTP 与 7782 SOCKS5 国家过滤端口使用这些出口国家；为空时不提供代理</div>
         </div>
       </div>
     </div>
@@ -629,6 +656,8 @@ const i18n = {
     'config.allowed_countries_help': '非空时仅允许这些国家入池，忽略黑名单',
     'config.blocked_countries': '屏蔽国家（黑名单）',
     'config.blocked_countries_help': '白名单为空时生效',
+    'config.country_proxy_countries': '7781/7782 端口国家过滤',
+    'config.country_proxy_countries_help': '7781 HTTP 与 7782 SOCKS5 国家过滤端口使用这些出口国家；为空时不提供代理',
     'config.cancel': '取消',
     'config.save': '保存配置',
     'msg.fetch_confirm': '确定开始抓取代理吗？',
@@ -648,6 +677,7 @@ const i18n = {
     'config.mode_custom_only': '仅订阅代理（只使用订阅导入的代理）',
     'config.mode_free_only': '仅免费代理（只使用公开抓取的代理）',
     'config.section_free_pool': '免费代理池',
+    'config.section_sources': '代理来源',
     'config.pool_capacity': '池子容量',
     'config.pool_capacity_help': '免费代理总槽位',
     'config.http_ratio_label': 'HTTP 占比',
@@ -660,6 +690,17 @@ const i18n = {
     'config.refresh_interval': '默认刷新间隔 (分钟)',
     'config.refresh_interval_help': '新订阅的默���刷新周期',
     'config.geo_filter_help': '免费代理删除，订阅代理禁用',
+    'source.add_title': '添加来源',
+    'source.add_btn': '添加',
+    'source.help': '手动来源会保存到 config.json，并参与后续抓取；内置来源只能刷新，不能删除',
+    'source.refresh': '刷新',
+    'source.delete': '删除',
+    'source.builtin': '内置',
+    'source.custom': '自定义',
+    'source.empty': '暂无自定义来源',
+    'source.added': '来源已添加',
+    'source.deleted': '来源已删除',
+    'source.refresh_started': '来源刷新已启动',
     // 健康面板
     'health.free_pool': 'FREE_POOL',
     'health.sub_pool': 'SUBSCRIPTION_POOL',
@@ -784,6 +825,8 @@ const i18n = {
     'config.allowed_countries_help': 'When set, only these countries are allowed; blacklist is ignored',
     'config.blocked_countries': 'Blocked Countries (Blacklist)',
     'config.blocked_countries_help': 'Effective only when whitelist is empty',
+    'config.country_proxy_countries': '7781/7782 Port Country Filter',
+    'config.country_proxy_countries_help': 'The 7781 HTTP and 7782 SOCKS5 country-filtered ports use these exit countries; empty means no proxy is served',
     'config.cancel': 'Cancel',
     'config.save': 'Save Configuration',
     'msg.fetch_confirm': 'Start proxy fetch?',
@@ -802,6 +845,7 @@ const i18n = {
     'config.mode_custom_only': 'Subscription Only',
     'config.mode_free_only': 'Free Only',
     'config.section_free_pool': 'Free Proxy Pool',
+    'config.section_sources': 'Proxy Sources',
     'config.pool_capacity': 'Pool Capacity',
     'config.pool_capacity_help': 'Total free proxy slots',
     'config.http_ratio_label': 'HTTP Ratio',
@@ -814,6 +858,17 @@ const i18n = {
     'config.refresh_interval': 'Default Refresh (min)',
     'config.refresh_interval_help': 'Default refresh cycle for new subscriptions',
     'config.geo_filter_help': 'Free: delete, Subscription: disable',
+    'source.add_title': 'Add Source',
+    'source.add_btn': 'Add',
+    'source.help': 'Manual sources are saved to config.json and included in future fetches; built-in sources can only be refreshed',
+    'source.refresh': 'Refresh',
+    'source.delete': 'Delete',
+    'source.builtin': 'Built-in',
+    'source.custom': 'Custom',
+    'source.empty': 'No custom sources',
+    'source.added': 'Source added',
+    'source.deleted': 'Source deleted',
+    'source.refresh_started': 'Source refresh started',
     'health.free_pool': 'FREE_POOL',
     'health.sub_pool': 'SUBSCRIPTION_POOL',
     'health.free_proxies': 'Free Proxies',
@@ -871,6 +926,14 @@ let logCountdown = 5;
 
 function t(key) {
   return i18n[currentLang][key] || key;
+}
+
+function escapeHTML(value) {
+  return String(value || '').replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
+}
+
+function escapeJSString(value) {
+  return String(value || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/\n/g, '\\n').replace(/\r/g, '\\r');
 }
 
 function updateLogCountdown() {
@@ -1226,6 +1289,7 @@ async function openSettings() {
   document.getElementById('cfg-replace-threshold').value = cfg.replace_threshold;
   document.getElementById('cfg-blocked-countries').value = (cfg.blocked_countries || []).join(',');
   document.getElementById('cfg-allowed-countries').value = (cfg.allowed_countries || []).join(',');
+  document.getElementById('cfg-country-proxy-countries').value = (cfg.country_proxy_countries || []).join(',');
   // 将 mode + priority 映射到5种模式
   const mode = cfg.custom_proxy_mode || 'mixed';
   const customPri = cfg.custom_priority === true;
@@ -1240,11 +1304,82 @@ async function openSettings() {
   document.getElementById('cfg-custom-probe').value = cfg.custom_probe_interval || 10;
   document.getElementById('cfg-custom-refresh').value = cfg.custom_refresh_interval || 60;
 
+  loadSources();
   document.getElementById('settings-modal').classList.add('show');
 }
 
 function closeSettings() {
   document.getElementById('settings-modal').classList.remove('show');
+}
+
+async function loadSources() {
+  const el = document.getElementById('source-list');
+  if (!el) return;
+  const sources = await api('/api/sources');
+  if (!sources || sources.length === 0) {
+    el.innerHTML = '<div style="color:var(--gray-5);text-align:center;padding:8px">' + t('source.empty') + '</div>';
+    return;
+  }
+  el.innerHTML = sources.map(src => {
+    const tag = src.custom ? t('source.custom') : t('source.builtin');
+    const color = src.custom ? 'var(--yellow)' : 'var(--fg-dim)';
+    const safeURL = escapeHTML(src.url);
+    const safeProtocol = escapeHTML(src.protocol);
+    const jsURL = escapeJSString(src.url);
+    const jsProtocol = escapeJSString(src.protocol);
+    const delBtn = src.custom ? '<button class="btn-danger" onclick="deleteSource(\'' + jsURL + '\',\'' + jsProtocol + '\')">' + t('source.delete') + '</button>' : '';
+    return '<div style="display:grid;grid-template-columns:80px 1fr auto;gap:8px;align-items:center;padding:6px 0;border-bottom:1px solid var(--border)">' +
+      '<span class="badge badge-' + safeProtocol + '">' + safeProtocol.toUpperCase() + '</span>' +
+      '<div style="min-width:0"><div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + safeURL + '">' + safeURL + '</div><div style="color:' + color + ';font-size:8px">' + escapeHTML(tag) + '</div></div>' +
+      '<div style="display:flex;gap:4px"><button class="btn-action" onclick="refreshSource(\'' + jsURL + '\',\'' + jsProtocol + '\')">' + t('source.refresh') + '</button>' + delBtn + '</div>' +
+    '</div>';
+  }).join('');
+}
+
+async function addSource() {
+  const url = document.getElementById('source-url').value.trim();
+  const protocol = document.getElementById('source-protocol').value;
+  if (!url) return;
+  const result = await api('/api/source/add', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({url, protocol})
+  });
+  if (result && result.status === 'added') {
+    document.getElementById('source-url').value = '';
+    alert(t('source.added'));
+    loadSources();
+  } else {
+    alert(t('msg.config_failed'));
+  }
+}
+
+async function deleteSource(url, protocol) {
+  if (!confirm(t('source.delete') + ' ' + url + '?')) return;
+  const result = await api('/api/source/delete', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({url, protocol})
+  });
+  if (result && result.status === 'deleted') {
+    alert(t('source.deleted'));
+    loadSources();
+  } else {
+    alert(t('msg.config_failed'));
+  }
+}
+
+async function refreshSource(url, protocol) {
+  const result = await api('/api/source/refresh', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({url, protocol})
+  });
+  if (result && result.status === 'refresh started') {
+    alert(t('source.refresh_started'));
+  } else {
+    alert(t('msg.config_failed'));
+  }
 }
 
 async function saveConfig() {
@@ -1263,6 +1398,7 @@ async function saveConfig() {
     replace_threshold: parseFloat(document.getElementById('cfg-replace-threshold').value),
     blocked_countries: document.getElementById('cfg-blocked-countries').value.split(',').map(s => s.trim().toUpperCase()).filter(s => s),
     allowed_countries: document.getElementById('cfg-allowed-countries').value.split(',').map(s => s.trim().toUpperCase()).filter(s => s),
+    country_proxy_countries: document.getElementById('cfg-country-proxy-countries').value.split(',').map(s => s.trim().toUpperCase()).filter(s => s),
     custom_proxy_mode: (() => {
       const m = document.getElementById('cfg-custom-mode').value;
       if (m === 'custom_only') return 'custom_only';

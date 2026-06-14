@@ -4,30 +4,30 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
-	"math/rand"
 	"strings"
+	"sync"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 )
 
 type Proxy struct {
-	ID           int64     `json:"id"`
-	Address      string    `json:"address"`
-	Protocol     string    `json:"protocol"`
-	ExitIP       string    `json:"exit_ip"`
-	ExitLocation string    `json:"exit_location"`
-	Latency      int       `json:"latency"`
-	QualityGrade string    `json:"quality_grade"`
-	UseCount     int       `json:"use_count"`
-	SuccessCount int       `json:"success_count"`
-	FailCount    int       `json:"fail_count"`
-	LastUsed     time.Time `json:"last_used"`
-	LastCheck    time.Time `json:"last_check"`
-	CreatedAt    time.Time `json:"created_at"`
+	ID             int64     `json:"id"`
+	Address        string    `json:"address"`
+	Protocol       string    `json:"protocol"`
+	ExitIP         string    `json:"exit_ip"`
+	ExitLocation   string    `json:"exit_location"`
+	Latency        int       `json:"latency"`
+	QualityGrade   string    `json:"quality_grade"`
+	UseCount       int       `json:"use_count"`
+	SuccessCount   int       `json:"success_count"`
+	FailCount      int       `json:"fail_count"`
+	LastUsed       time.Time `json:"last_used"`
+	LastCheck      time.Time `json:"last_check"`
+	CreatedAt      time.Time `json:"created_at"`
 	Status         string    `json:"status"`
 	Source         string    `json:"source"`          // "free" 或 "custom"
-	SubscriptionID int64    `json:"subscription_id"` // 所属订阅ID（0=免费代理）
+	SubscriptionID int64     `json:"subscription_id"` // 所属订阅ID（0=免费代理）
 }
 
 // Subscription 订阅信息
@@ -55,12 +55,18 @@ type SourceStatus struct {
 	ConsecutiveFails int
 	LastSuccess      time.Time
 	LastFail         time.Time
-	Status           string    // active/degraded/disabled
+	Status           string // active/degraded/disabled
 	DisabledUntil    time.Time
 }
 
 type Storage struct {
-	db *sql.DB
+	db        *sql.DB
+	useEvents chan proxyUseEvent
+	useWG     sync.WaitGroup
+}
+
+type proxyUseEvent struct {
+	address string
 }
 
 func New(dbPath string) (*Storage, error) {
@@ -69,13 +75,72 @@ func New(dbPath string) (*Storage, error) {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
 
-	db.SetMaxOpenConns(1) // SQLite 单写
+	db.SetMaxOpenConns(8) // WAL 下允许并发读，写入仍由 SQLite 串行化
+	db.SetMaxIdleConns(4)
+	db.SetConnMaxLifetime(30 * time.Minute)
+	db.Exec(`PRAGMA journal_mode = WAL`)
+	db.Exec(`PRAGMA synchronous = NORMAL`)
+	db.Exec(`PRAGMA busy_timeout = 5000`)
 
-	s := &Storage{db: db}
+	s := &Storage{db: db, useEvents: make(chan proxyUseEvent, 65536)}
 	if err := s.initSchema(); err != nil {
 		return nil, err
 	}
+	s.startProxyUseWriter()
 	return s, nil
+}
+
+func (s *Storage) startProxyUseWriter() {
+	s.useWG.Add(1)
+	go func() {
+		defer s.useWG.Done()
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+
+		pending := make(map[string]int)
+		flush := func() {
+			if len(pending) == 0 {
+				return
+			}
+			tx, err := s.db.Begin()
+			if err != nil {
+				log.Printf("[storage] 批量更新使用统计失败: %v", err)
+				return
+			}
+			stmt, err := tx.Prepare(`UPDATE proxies SET use_count = use_count + ?, success_count = success_count + ?, last_used = CURRENT_TIMESTAMP WHERE address = ?`)
+			if err != nil {
+				tx.Rollback()
+				log.Printf("[storage] 准备使用统计更新失败: %v", err)
+				return
+			}
+			for address, count := range pending {
+				if _, err := stmt.Exec(count, count, address); err != nil {
+					log.Printf("[storage] 更新使用统计失败 %s: %v", address, err)
+				}
+			}
+			stmt.Close()
+			if err := tx.Commit(); err != nil {
+				log.Printf("[storage] 提交使用统计失败: %v", err)
+			}
+			pending = make(map[string]int)
+		}
+
+		for {
+			select {
+			case event, ok := <-s.useEvents:
+				if !ok {
+					flush()
+					return
+				}
+				pending[event.address]++
+				if len(pending) >= 256 {
+					flush()
+				}
+			case <-ticker.C:
+				flush()
+			}
+		}
+	}()
 }
 
 func (s *Storage) initSchema() error {
@@ -252,7 +317,7 @@ func (s *Storage) AddProxy(address, protocol string) error {
 		log.Printf("[storage] AddProxy %s error: %v", address, err)
 		return err
 	}
-	
+
 	// 检查是否真的插入了
 	affected, _ := result.RowsAffected()
 	if affected == 0 {
@@ -284,29 +349,7 @@ func (s *Storage) AddProxies(proxies []Proxy) error {
 
 // GetRandom 随机取一个可用代理（优先选择质量高的）
 func (s *Storage) GetRandom() (*Proxy, error) {
-	rows, err := s.db.Query(
-		`SELECT `+proxyColumns+`
-		 FROM proxies
-		 WHERE status = 'active' AND fail_count < 3
-		 ORDER BY
-		   CASE quality_grade
-		     WHEN 'S' THEN 1
-		     WHEN 'A' THEN 2
-		     WHEN 'B' THEN 3
-		     ELSE 4
-		   END,
-		   RANDOM()
-		 LIMIT 1`,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	if rows.Next() {
-		return scanProxy(rows)
-	}
-	return nil, fmt.Errorf("no available proxy")
+	return s.queryOneProxy("", "", nil, nil, randomProxyOrder())
 }
 
 // proxyColumns 代理表查询的标准列列表
@@ -339,6 +382,76 @@ func scanProxy(rows *sql.Rows) (*Proxy, error) {
 		p.SubscriptionID = subID.Int64
 	}
 	return p, nil
+}
+
+func randomProxyOrder() string {
+	return `ORDER BY
+		CASE quality_grade
+			WHEN 'S' THEN 1
+			WHEN 'A' THEN 2
+			WHEN 'B' THEN 3
+			ELSE 4
+		END,
+		RANDOM()`
+}
+
+func (s *Storage) queryOneProxy(sourceFilter, protocol string, excludes []string, countryCodes []string, orderBy string) (*Proxy, error) {
+	query := `SELECT ` + proxyColumns + `
+		 FROM proxies
+		 WHERE status IN ('active', 'degraded') AND fail_count < 3`
+	args := make([]interface{}, 0, 2+len(excludes)+len(countryCodes)*2)
+
+	if sourceFilter != "" {
+		query += ` AND source = ?`
+		args = append(args, sourceFilter)
+	}
+	if protocol != "" {
+		query += ` AND protocol = ?`
+		args = append(args, protocol)
+	}
+	if len(excludes) > 0 {
+		placeholders := make([]string, len(excludes))
+		for i, address := range excludes {
+			placeholders[i] = "?"
+			args = append(args, address)
+		}
+		query += ` AND address NOT IN (` + strings.Join(placeholders, ",") + `)`
+	}
+	if len(countryCodes) > 0 {
+		conditions := make([]string, 0, len(countryCodes)*2)
+		for _, code := range countryCodes {
+			code = strings.TrimSpace(strings.ToUpper(code))
+			if code == "" {
+				continue
+			}
+			conditions = append(conditions, `exit_location = ?`, `exit_location LIKE ?`)
+			args = append(args, code, code+" %")
+		}
+		if len(conditions) > 0 {
+			query += ` AND (` + strings.Join(conditions, ` OR `) + `)`
+		}
+	}
+
+	query += " " + orderBy + ` LIMIT 1`
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	if rows.Next() {
+		return scanProxy(rows)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if protocol != "" {
+		return nil, fmt.Errorf("no %s proxy available", protocol)
+	}
+	if sourceFilter != "" {
+		return nil, fmt.Errorf("no available %s proxy", sourceFilter)
+	}
+	return nil, fmt.Errorf("no available proxy")
 }
 
 // GetAll 获取所有可用代理
@@ -383,32 +496,15 @@ func (s *Storage) GetRandomExclude(excludes []string) (*Proxy, error) {
 
 // GetRandomExcludeFiltered 排除指定地址随机取一个（可按来源过滤）
 func (s *Storage) GetRandomExcludeFiltered(excludes []string, sourceFilter string) (*Proxy, error) {
-	proxies, err := s.GetAllFiltered(sourceFilter)
-	if err != nil {
-		return nil, err
-	}
+	return s.queryOneProxy(sourceFilter, "", excludes, nil, randomProxyOrder())
+}
 
-	excludeMap := make(map[string]bool)
-	for _, e := range excludes {
-		excludeMap[e] = true
+// GetRandomExcludeFilteredByCountries 按出口国家过滤后随机取一个（可按来源过滤）
+func (s *Storage) GetRandomExcludeFilteredByCountries(excludes []string, sourceFilter string, countryCodes []string) (*Proxy, error) {
+	if len(countryCodes) == 0 {
+		return nil, fmt.Errorf("country filter is empty")
 	}
-
-	var available []Proxy
-	for _, p := range proxies {
-		if !excludeMap[p.Address] {
-			available = append(available, p)
-		}
-	}
-
-	if len(available) == 0 {
-		if sourceFilter != "" {
-			return nil, fmt.Errorf("no available %s proxy", sourceFilter)
-		}
-		return s.GetRandom()
-	}
-
-	p := available[rand.Intn(len(available))]
-	return &p, nil
+	return s.queryOneProxy(sourceFilter, "", excludes, countryCodes, randomProxyOrder())
 }
 
 // GetLowestLatencyExclude 排除指定地址后获取延迟最低的代理
@@ -418,24 +514,7 @@ func (s *Storage) GetLowestLatencyExclude(excludes []string) (*Proxy, error) {
 
 // GetLowestLatencyExcludeFiltered 排除指定地址后获取延迟最低的代理（可按来源过滤）
 func (s *Storage) GetLowestLatencyExcludeFiltered(excludes []string, sourceFilter string) (*Proxy, error) {
-	proxies, err := s.GetAllFiltered(sourceFilter)
-	if err != nil {
-		return nil, err
-	}
-
-	excludeMap := make(map[string]bool)
-	for _, e := range excludes {
-		excludeMap[e] = true
-	}
-
-	for _, p := range proxies {
-		if !excludeMap[p.Address] {
-			proxy := p
-			return &proxy, nil
-		}
-	}
-
-	return nil, fmt.Errorf("no available proxy")
+	return s.queryOneProxy(sourceFilter, "", excludes, nil, `ORDER BY latency ASC`)
 }
 
 // GetRandomByProtocolExclude 按协议获取随机代理（排除已尝试的）
@@ -445,29 +524,15 @@ func (s *Storage) GetRandomByProtocolExclude(protocol string, excludes []string)
 
 // GetRandomByProtocolExcludeFiltered 按协议获取随机代理（可按来源过滤）
 func (s *Storage) GetRandomByProtocolExcludeFiltered(protocol string, excludes []string, sourceFilter string) (*Proxy, error) {
-	proxies, err := s.GetAllFiltered(sourceFilter)
-	if err != nil {
-		return nil, err
-	}
+	return s.queryOneProxy(sourceFilter, protocol, excludes, nil, randomProxyOrder())
+}
 
-	excludeMap := make(map[string]bool)
-	for _, e := range excludes {
-		excludeMap[e] = true
+// GetRandomByProtocolExcludeFilteredByCountries 按协议和出口国家过滤后随机取一个（可按来源过滤）
+func (s *Storage) GetRandomByProtocolExcludeFilteredByCountries(protocol string, excludes []string, sourceFilter string, countryCodes []string) (*Proxy, error) {
+	if len(countryCodes) == 0 {
+		return nil, fmt.Errorf("country filter is empty")
 	}
-
-	var available []Proxy
-	for _, p := range proxies {
-		if p.Protocol == protocol && !excludeMap[p.Address] {
-			available = append(available, p)
-		}
-	}
-
-	if len(available) == 0 {
-		return nil, fmt.Errorf("no %s proxy available", protocol)
-	}
-
-	proxy := available[time.Now().UnixNano()%int64(len(available))]
-	return &proxy, nil
+	return s.queryOneProxy(sourceFilter, protocol, excludes, countryCodes, randomProxyOrder())
 }
 
 // GetLowestLatencyByProtocolExclude 按协议获取最低延迟代理（排除已尝试的）
@@ -477,24 +542,7 @@ func (s *Storage) GetLowestLatencyByProtocolExclude(protocol string, excludes []
 
 // GetLowestLatencyByProtocolExcludeFiltered 按协议获取最低延迟代理（可按来源过滤）
 func (s *Storage) GetLowestLatencyByProtocolExcludeFiltered(protocol string, excludes []string, sourceFilter string) (*Proxy, error) {
-	proxies, err := s.GetAllFiltered(sourceFilter)
-	if err != nil {
-		return nil, err
-	}
-
-	excludeMap := make(map[string]bool)
-	for _, e := range excludes {
-		excludeMap[e] = true
-	}
-
-	for _, p := range proxies {
-		if p.Protocol == protocol && !excludeMap[p.Address] {
-			proxy := p
-			return &proxy, nil
-		}
-	}
-
-	return nil, fmt.Errorf("no %s proxy available", protocol)
+	return s.queryOneProxy(sourceFilter, protocol, excludes, nil, `ORDER BY latency ASC`)
 }
 
 // Delete 立即删除指定代理
@@ -543,12 +591,12 @@ func (s *Storage) UpdateExitInfo(address, exitIP, exitLocation string, latencyMs
 // RecordProxyUse 记录代理使用（成功）
 func (s *Storage) RecordProxyUse(address string, success bool) error {
 	if success {
-		_, err := s.db.Exec(
-			`UPDATE proxies SET use_count = use_count + 1, success_count = success_count + 1, 
-			 last_used = CURRENT_TIMESTAMP WHERE address = ?`,
-			address,
-		)
-		return err
+		select {
+		case s.useEvents <- proxyUseEvent{address: address}:
+		default:
+			// 高吞吐时丢弃成功统计，避免统计写入阻塞代理转发路径。
+		}
+		return nil
 	}
 	_, err := s.db.Exec(
 		`UPDATE proxies SET use_count = use_count + 1, fail_count = fail_count + 1, 
@@ -933,7 +981,7 @@ func (s *Storage) EnableProxy(address string) error {
 // GetDisabledCustomProxies 获取所有被禁用的订阅代理
 func (s *Storage) GetDisabledCustomProxies() ([]Proxy, error) {
 	rows, err := s.db.Query(
-		`SELECT `+proxyColumns+`
+		`SELECT ` + proxyColumns + `
 		 FROM proxies
 		 WHERE source = 'custom' AND status = 'disabled'`,
 	)
@@ -1096,7 +1144,7 @@ func (s *Storage) GetSubscriptions() ([]Subscription, error) {
 // GetSubscription 获取单个订阅
 func (s *Storage) GetSubscription(id int64) (*Subscription, error) {
 	rows, err := s.db.Query(
-		`SELECT ` + subColumns + `
+		`SELECT `+subColumns+`
 		 FROM subscriptions WHERE id = ?`, id,
 	)
 	if err != nil {
@@ -1186,6 +1234,8 @@ func scanSubscription(rows *sql.Rows) (*Subscription, error) {
 
 // Close 关闭数据库
 func (s *Storage) Close() error {
+	close(s.useEvents)
+	s.useWG.Wait()
 	return s.db.Close()
 }
 

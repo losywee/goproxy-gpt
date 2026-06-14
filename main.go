@@ -57,7 +57,7 @@ func main() {
 	poolMgr := pool.NewManager(store, cfg)
 	healthChecker := checker.NewHealthChecker(store, validate, cfg, poolMgr)
 	opt := optimizer.NewOptimizer(store, fetch, validate, poolMgr, cfg)
-	
+
 	// 清理无效代理（免费代理删除，订阅代理禁用）
 	totalDeleted := 0
 	if len(cfg.AllowedCountries) > 0 {
@@ -81,14 +81,16 @@ func main() {
 		log.Printf("[main] 🧹 已清理 %d 个无出口信息的代理", deleted)
 		totalDeleted += int(deleted)
 	}
-	
-	// 创建 HTTP 代理服务器：随机轮换 + 最低延迟
+
+	// 创建 HTTP 代理服务器：随机轮换 + 最低延迟 + 国家过滤
 	randomServer := proxy.New(store, cfg, "random", cfg.ProxyPort)
 	stableServer := proxy.New(store, cfg, "lowest-latency", cfg.StableProxyPort)
-	
-	// 创建 SOCKS5 代理服务器：随机轮换 + 最低延迟
+	countryServer := proxy.NewCountryFiltered(store, cfg, "random", cfg.CountryProxyPort, cfg.CountryProxyCountries)
+
+	// 创建 SOCKS5 代理服务器：随机轮换 + 最低延迟 + 国家过滤
 	socks5RandomServer := proxy.NewSOCKS5(store, cfg, "random", cfg.SOCKS5Port)
 	socks5StableServer := proxy.NewSOCKS5(store, cfg, "lowest-latency", cfg.StableSOCKS5Port)
+	socks5CountryServer := proxy.NewSOCKS5CountryFiltered(store, cfg, "random", cfg.CountrySOCKS5Port)
 
 	// 初始化订阅管理器
 	customMgr := custom.NewManager(store, validate, cfg)
@@ -99,6 +101,8 @@ func main() {
 	// 启动 WebUI（传递池子管理器和订阅管理器）
 	ui := webui.New(store, cfg, poolMgr, customMgr, func() {
 		go smartFetchAndFill(fetch, validate, store, poolMgr)
+	}, func(sourceURL, protocol string) {
+		go refreshSource(fetch, validate, poolMgr, sourceURL, protocol)
 	}, configChanged)
 	ui.Start()
 
@@ -148,10 +152,65 @@ func main() {
 		}
 	}()
 
+	// 启动国家过滤 HTTP 代理服务
+	go func() {
+		if err := countryServer.Start(); err != nil {
+			log.Fatalf("country filtered http proxy server: %v", err)
+		}
+	}()
+
+	// 启动国家过滤 SOCKS5 代理服务
+	go func() {
+		if err := socks5CountryServer.Start(); err != nil {
+			log.Fatalf("country filtered socks5 proxy server: %v", err)
+		}
+	}()
+
 	// 启动 HTTP 随机代理服务（阻塞）
 	if err := randomServer.Start(); err != nil {
 		log.Fatalf("random http proxy server: %v", err)
 	}
+}
+
+func admitValidationResults(results <-chan validator.Result, poolMgr *pool.Manager, statusState string) (validCount, addedCount int) {
+	for result := range results {
+		if !result.Valid || result.ExitIP == "" || result.ExitLocation == "" {
+			continue
+		}
+		cfg := config.Get()
+		latencyMs := int(result.Latency.Milliseconds())
+		if cfg != nil && latencyMs > cfg.GetLatencyThreshold(statusState) {
+			continue
+		}
+		validCount++
+		proxyToAdd := storage.Proxy{
+			Address:      result.Proxy.Address,
+			Protocol:     result.Proxy.Protocol,
+			ExitIP:       result.ExitIP,
+			ExitLocation: result.ExitLocation,
+			Latency:      latencyMs,
+		}
+		if added, _ := poolMgr.TryAddProxy(proxyToAdd); added {
+			addedCount++
+		}
+	}
+	return validCount, addedCount
+}
+
+func refreshSource(fetch *fetcher.Fetcher, validate *validator.Validator, poolMgr *pool.Manager, sourceURL, protocol string) {
+	log.Printf("[fetch] 手动刷新来源: %s (%s)", sourceURL, protocol)
+	candidates, err := fetch.FetchSource(fetcher.Source{URL: sourceURL, Protocol: protocol})
+	if err != nil {
+		log.Printf("[fetch] 手动刷新来源失败: %s (%s): %v", sourceURL, protocol, err)
+		return
+	}
+	status, err := poolMgr.GetStatus()
+	statusState := ""
+	if err == nil && status != nil {
+		statusState = status.State
+	}
+	validCount, addedCount := admitValidationResults(validate.ValidateStream(candidates), poolMgr, statusState)
+	log.Printf("[fetch] 手动刷新来源完成: %s (%s) 候选%d 通过%d 入池%d", sourceURL, protocol, len(candidates), validCount, addedCount)
 }
 
 // smartFetchAndFill 智能抓取和填充

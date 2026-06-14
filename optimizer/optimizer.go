@@ -34,6 +34,10 @@ func NewOptimizer(s *storage.Storage, f *fetcher.Fetcher, v *validator.Validator
 func (o *Optimizer) RunOnce() {
 	start := time.Now()
 	log.Println("[optimize] 🎯 开始优化轮换...")
+	cfg := config.Get()
+	if cfg == nil {
+		cfg = o.cfg
+	}
 
 	// 获取池子状态
 	status, err := o.poolMgr.GetStatus()
@@ -60,11 +64,15 @@ func (o *Optimizer) RunOnce() {
 
 	// 验证候选代理
 	validCandidates := []storage.Proxy{}
-	for result := range o.validator.ValidateStream(candidates) {
+	validate := o.validator
+	if cfg.OptimizeConcurrency > 0 {
+		validate = validator.New(cfg.OptimizeConcurrency, cfg.ValidateTimeout, cfg.ValidateURL)
+	}
+	for result := range validate.ValidateStream(candidates) {
 		if result.Valid {
 			latencyMs := int(result.Latency.Milliseconds())
 			// 只保留延迟在健康标准内的
-			if latencyMs <= o.cfg.MaxLatencyHealthy {
+			if latencyMs <= cfg.MaxLatencyHealthy {
 				validCandidates = append(validCandidates, storage.Proxy{
 					Address:      result.Proxy.Address,
 					Protocol:     result.Proxy.Protocol,
@@ -76,7 +84,7 @@ func (o *Optimizer) RunOnce() {
 		}
 	}
 
-	log.Printf("[optimize] 验证通过 %d 个优质候选（延迟<%dms）", len(validCandidates), o.cfg.MaxLatencyHealthy)
+	log.Printf("[optimize] 验证通过 %d 个优质候选（延迟<%dms）", len(validCandidates), cfg.MaxLatencyHealthy)
 
 	if len(validCandidates) == 0 {
 		log.Println("[optimize] 无优质候选，跳过优化")
@@ -98,11 +106,19 @@ func (o *Optimizer) RunOnce() {
 
 // StartBackground 后台定时优化
 func (o *Optimizer) StartBackground() {
-	ticker := time.NewTicker(time.Duration(o.cfg.OptimizeInterval) * time.Minute)
 	go func() {
-		for range ticker.C {
+		for {
+			cfg := config.Get()
+			if cfg == nil {
+				cfg = o.cfg
+			}
+			time.Sleep(time.Duration(cfg.OptimizeInterval) * time.Minute)
 			o.RunOnce()
 		}
 	}()
-	log.Printf("[optimize] 优化轮换器已启动，间隔 %d 分钟", o.cfg.OptimizeInterval)
+	cfg := config.Get()
+	if cfg == nil {
+		cfg = o.cfg
+	}
+	log.Printf("[optimize] 优化轮换器已启动，间隔 %d 分钟", cfg.OptimizeInterval)
 }
